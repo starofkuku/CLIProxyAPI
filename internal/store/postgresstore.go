@@ -20,18 +20,23 @@ import (
 )
 
 const (
-	defaultConfigTable = "config_store"
-	defaultAuthTable   = "auth_store"
-	defaultConfigKey   = "config"
+	defaultConfigTable      = "config_store"
+	defaultAuthTable        = "auth_store"
+	defaultUsageTable       = "usage_store"
+	defaultUsageDetailTable = "usage_detail_store"
+	defaultConfigKey        = "config"
+	defaultUsageKey         = "usage_snapshot"
 )
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
 type PostgresStoreConfig struct {
-	DSN         string
-	Schema      string
-	ConfigTable string
-	AuthTable   string
-	SpoolDir    string
+	DSN              string
+	Schema           string
+	ConfigTable      string
+	AuthTable        string
+	UsageTable       string
+	UsageDetailTable string
+	SpoolDir         string
 }
 
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
@@ -57,6 +62,12 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	}
 	if cfg.AuthTable == "" {
 		cfg.AuthTable = defaultAuthTable
+	}
+	if cfg.UsageTable == "" {
+		cfg.UsageTable = defaultUsageTable
+	}
+	if cfg.UsageDetailTable == "" {
+		cfg.UsageDetailTable = defaultUsageDetailTable
 	}
 
 	spoolRoot := strings.TrimSpace(cfg.SpoolDir)
@@ -139,6 +150,66 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		)
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
+	}
+	usageTable := s.fullTableName(s.cfg.UsageTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id TEXT PRIMARY KEY,
+			content JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+		`, usageTable)); err != nil {
+		return fmt.Errorf("postgres store: create usage table: %w", err)
+	}
+	usageDetailTable := s.fullTableName(s.cfg.UsageDetailTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			dedup_key TEXT PRIMARY KEY,
+			api_name TEXT NOT NULL,
+			api_key_hash TEXT NOT NULL DEFAULT '',
+			model_name TEXT NOT NULL,
+			requested_at TIMESTAMPTZ NOT NULL,
+			source TEXT NOT NULL DEFAULT '',
+			auth_index TEXT NOT NULL DEFAULT '',
+			failed BOOLEAN NOT NULL DEFAULT FALSE,
+			input_tokens BIGINT NOT NULL DEFAULT 0,
+			output_tokens BIGINT NOT NULL DEFAULT 0,
+			reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+			cached_tokens BIGINT NOT NULL DEFAULT 0,
+			total_tokens BIGINT NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`, usageDetailTable)); err != nil {
+		return fmt.Errorf("postgres store: create usage detail table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS api_key_hash TEXT NOT NULL DEFAULT ''",
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: alter usage detail table add api_key_hash: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"CREATE INDEX IF NOT EXISTS %s ON %s (requested_at)",
+		quoteIdentifier(s.cfg.UsageDetailTable+"_requested_at_idx"),
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: create usage detail requested_at index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"CREATE INDEX IF NOT EXISTS %s ON %s (api_name, model_name)",
+		quoteIdentifier(s.cfg.UsageDetailTable+"_api_model_idx"),
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: create usage detail api/model index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"CREATE INDEX IF NOT EXISTS %s ON %s (api_key_hash, requested_at)",
+		quoteIdentifier(s.cfg.UsageDetailTable+"_api_key_hash_requested_at_idx"),
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: create usage detail api_key_hash/requested_at index: %w", err)
 	}
 	return nil
 }
@@ -310,7 +381,6 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			LastRefreshedAt:  time.Time{},
 			NextRefreshAfter: time.Time{},
 		}
-		cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {
@@ -541,6 +611,18 @@ func (s *PostgresStore) deleteConfigRecord(ctx context.Context) error {
 	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", s.fullTableName(s.cfg.ConfigTable))
 	if _, err := s.db.ExecContext(ctx, query, defaultConfigKey); err != nil {
 		return fmt.Errorf("postgres store: delete config: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) deleteUsageSnapshot(ctx context.Context) error {
+	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", s.fullTableName(s.cfg.UsageTable))
+	if _, err := s.db.ExecContext(ctx, query, defaultUsageKey); err != nil {
+		return fmt.Errorf("postgres store: delete usage snapshot: %w", err)
+	}
+	query = fmt.Sprintf("DELETE FROM %s", s.fullTableName(s.cfg.UsageDetailTable))
+	if _, err := s.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("postgres store: delete usage detail rows: %w", err)
 	}
 	return nil
 }

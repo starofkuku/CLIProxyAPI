@@ -419,6 +419,11 @@ func main() {
 	}
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	if usePostgresStore && pgStoreInst != nil {
+		usage.SetUsageRecordWriter(pgStoreInst)
+	} else {
+		usage.SetUsageRecordWriter(nil)
+	}
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
 		log.Errorf("failed to configure log output: %v", err)

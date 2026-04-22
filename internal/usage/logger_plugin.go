@@ -5,7 +5,10 @@ package usage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +31,27 @@ type LoggerPlugin struct {
 	stats *RequestStatistics
 }
 
+type RecordWriter interface {
+	AppendUsageRecord(ctx context.Context, record PersistentRecord) error
+}
+
+type PersistentRecord struct {
+	APIName     string
+	APIKeyHash  string
+	ModelName   string
+	RequestedAt time.Time
+	LatencyMs   int64
+	Source      string
+	AuthIndex   string
+	Failed      bool
+	Tokens      TokenStats
+}
+
+var (
+	usageRecordWriterMu sync.RWMutex
+	usageRecordWriter   RecordWriter
+)
+
 // NewLoggerPlugin constructs a new logger plugin instance.
 //
 // Returns:
@@ -47,7 +71,15 @@ func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 	if p == nil || p.stats == nil {
 		return
 	}
-	p.stats.Record(ctx, record)
+	normalized := normalisePersistentRecord(ctx, record)
+	p.stats.recordPersistent(normalized)
+	if writer := GetUsageRecordWriter(); writer != nil {
+		persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := writer.AppendUsageRecord(persistCtx, normalized); err != nil {
+			slog.Warn("usage direct persistence failed", "error", err)
+		}
+	}
 }
 
 // SetStatisticsEnabled toggles whether in-memory statistics are recorded.
@@ -55,6 +87,19 @@ func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
 
 // StatisticsEnabled reports the current recording state.
 func StatisticsEnabled() bool { return statisticsEnabled.Load() }
+
+func SetUsageRecordWriter(writer RecordWriter) {
+	usageRecordWriterMu.Lock()
+	usageRecordWriter = writer
+	usageRecordWriterMu.Unlock()
+}
+
+func GetUsageRecordWriter() RecordWriter {
+	usageRecordWriterMu.RLock()
+	writer := usageRecordWriter
+	usageRecordWriterMu.RUnlock()
+	return writer
+}
 
 // RequestStatistics maintains aggregated request metrics in memory.
 type RequestStatistics struct {
@@ -87,10 +132,10 @@ type modelStats struct {
 	Details       []RequestDetail
 }
 
-// RequestDetail stores the timestamp, latency, and token usage for a single request.
+// RequestDetail stores the timestamp and token usage for a single request.
 type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms"`
+	LatencyMs int64      `json:"latency_ms,omitempty"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
 	Tokens    TokenStats `json:"tokens"`
@@ -159,25 +204,19 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if !statisticsEnabled.Load() {
 		return
 	}
+	s.recordPersistent(normalisePersistentRecord(ctx, record))
+}
+
+func (s *RequestStatistics) recordPersistent(record PersistentRecord) {
+	if s == nil {
+		return
+	}
 	timestamp := record.RequestedAt
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
-	detail := normaliseDetail(record.Detail)
-	totalTokens := detail.TotalTokens
-	statsKey := record.APIKey
-	if statsKey == "" {
-		statsKey = resolveAPIIdentifier(ctx, record)
-	}
-	failed := record.Failed
-	if !failed {
-		failed = !resolveSuccess(ctx)
-	}
-	success := !failed
-	modelName := record.Model
-	if modelName == "" {
-		modelName = "unknown"
-	}
+	totalTokens := record.Tokens.TotalTokens
+	success := !record.Failed
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
@@ -192,18 +231,18 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	s.totalTokens += totalTokens
 
-	stats, ok := s.apis[statsKey]
+	stats, ok := s.apis[record.APIName]
 	if !ok {
 		stats = &apiStats{Models: make(map[string]*modelStats)}
-		s.apis[statsKey] = stats
+		s.apis[record.APIName] = stats
 	}
-	s.updateAPIStats(stats, modelName, RequestDetail{
+	s.updateAPIStats(stats, record.ModelName, RequestDetail{
 		Timestamp: timestamp,
-		LatencyMs: normaliseLatency(record.Latency),
+		LatencyMs: record.LatencyMs,
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
-		Failed:    failed,
+		Tokens:    record.Tokens,
+		Failed:    record.Failed,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -334,9 +373,6 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
-				if detail.LatencyMs < 0 {
-					detail.LatencyMs = 0
-				}
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
@@ -475,10 +511,49 @@ func normaliseLatency(latency time.Duration) int64 {
 	return latency.Milliseconds()
 }
 
+func normalisePersistentRecord(ctx context.Context, record coreusage.Record) PersistentRecord {
+	timestamp := record.RequestedAt
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	statsKey := strings.TrimSpace(record.APIKey)
+	if statsKey == "" {
+		statsKey = resolveAPIIdentifier(ctx, record)
+	}
+	failed := record.Failed
+	if !failed {
+		failed = !resolveSuccess(ctx)
+	}
+	modelName := strings.TrimSpace(record.Model)
+	if modelName == "" {
+		modelName = "unknown"
+	}
+	return PersistentRecord{
+		APIName:     statsKey,
+		APIKeyHash:  hashAPIKey(record.APIKey),
+		ModelName:   modelName,
+		RequestedAt: timestamp,
+		LatencyMs:   normaliseLatency(record.Latency),
+		Source:      record.Source,
+		AuthIndex:   record.AuthIndex,
+		Failed:      failed,
+		Tokens:      normaliseDetail(record.Detail),
+	}
+}
+
 func formatHour(hour int) string {
 	if hour < 0 {
 		hour = 0
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+func hashAPIKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:])
 }
