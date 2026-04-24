@@ -3,16 +3,25 @@ package registry
 import "testing"
 
 func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
-	tierModels := map[string][]*ModelInfo{
-		"free": GetCodexFreeModels(),
-		"team": GetCodexTeamModels(),
-		"plus": GetCodexPlusModels(),
-		"pro":  GetCodexProModels(),
+	tierModels := map[string]struct {
+		models   []*ModelInfo
+		expected bool
+	}{
+		"free": {models: GetCodexFreeModels(), expected: false},
+		"team": {models: GetCodexTeamModels(), expected: true},
+		"plus": {models: GetCodexPlusModels(), expected: true},
+		"pro":  {models: GetCodexProModels(), expected: true},
 	}
 
-	for tier, models := range tierModels {
+	for tier, tc := range tierModels {
 		t.Run(tier, func(t *testing.T) {
-			model := findModelInfo(models, "gpt-5.5")
+			model := findModelInfo(tc.models, "gpt-5.5")
+			if !tc.expected {
+				if model != nil {
+					t.Fatalf("expected codex %s tier to exclude gpt-5.5", tier)
+				}
+				return
+			}
 			if model == nil {
 				t.Fatalf("expected codex %s tier to include gpt-5.5", tier)
 			}
