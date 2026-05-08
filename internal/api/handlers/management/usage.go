@@ -3,11 +3,14 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
@@ -27,6 +30,8 @@ type usageLegacyMigratePayload struct {
 	Table string `json:"table"`
 }
 
+type usageQueueRecord []byte
+
 type usageLegacyMigrator interface {
 	MigrateLegacyUsageTable(ctx context.Context, tableName string) (store.UsageLegacyMigrationResult, error)
 }
@@ -38,6 +43,13 @@ type usageSnapshotLoader interface {
 type usageSnapshotStore interface {
 	LoadUsageSnapshot(ctx context.Context) ([]byte, error)
 	PersistUsageSnapshot(ctx context.Context, snapshot []byte) error
+}
+
+func (r usageQueueRecord) MarshalJSON() ([]byte, error) {
+	if json.Valid(r) {
+		return append([]byte(nil), r...), nil
+	}
+	return json.Marshal(string(r))
 }
 
 func (h *Handler) loadUsageSnapshot(ctx context.Context, flush bool) (usage.StatisticsSnapshot, error) {
@@ -126,7 +138,7 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 	}
 
 	var payload usageImportPayload
-	if err := json.Unmarshal(data, &payload); err != nil {
+	if err = json.Unmarshal(data, &payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
@@ -144,7 +156,7 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		stats := usage.NewRequestStatistics()
 		_ = stats.MergeSnapshot(current)
 		result := stats.MergeSnapshot(payload.Usage)
-		if err := usage.PersistSnapshot(c.Request.Context(), stats, store); err != nil {
+		if err = usage.PersistSnapshot(c.Request.Context(), stats, store); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -171,6 +183,40 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		"total_requests":  snapshot.TotalRequests,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+// GetUsageQueue pops queued usage records from the usage queue.
+func (h *Handler) GetUsageQueue(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+
+	count, errCount := parseUsageQueueCount(c.Query("count"))
+	if errCount != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errCount.Error()})
+		return
+	}
+
+	items := redisqueue.PopOldest(count)
+	records := make([]usageQueueRecord, 0, len(items))
+	for _, item := range items {
+		records = append(records, usageQueueRecord(append([]byte(nil), item...)))
+	}
+
+	c.JSON(http.StatusOK, records)
+}
+
+func parseUsageQueueCount(value string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 1, nil
+	}
+	count, errCount := strconv.Atoi(value)
+	if errCount != nil || count <= 0 {
+		return 0, errors.New("count must be a positive integer")
+	}
+	return count, nil
 }
 
 // MigrateLegacyUsageStatistics imports a legacy snapshot table into detail-row storage.
