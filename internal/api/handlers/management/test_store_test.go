@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -43,6 +44,7 @@ func (s *memoryAuthStore) Delete(_ context.Context, id string) error {
 	defer s.mu.Unlock()
 
 	delete(s.items, id)
+	delete(s.items, filepath.Base(id))
 	return nil
 }
 

@@ -2633,6 +2633,50 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 
+// RemoveByID removes an auth entry from the in-memory manager state without
+// persisting the change back to the backing store.
+func (m *Manager) RemoveByID(id string) bool {
+	if m == nil {
+		return false
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+
+	m.mu.Lock()
+	if _, ok := m.auths[id]; !ok {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.auths, id)
+	delete(m.modelPoolOffsets, strings.ToLower(id))
+	for key := range m.modelPoolOffsets {
+		if strings.HasPrefix(key, strings.ToLower(id)+"|") {
+			delete(m.modelPoolOffsets, key)
+		}
+	}
+	m.mu.Unlock()
+
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(id)
+	}
+
+	m.mu.RLock()
+	loop := m.refreshLoop
+	selector := m.selector
+	m.mu.RUnlock()
+
+	if loop != nil {
+		loop.remove(id)
+	}
+	if invalidator, ok := selector.(interface{ InvalidateAuth(string) }); ok {
+		invalidator.InvalidateAuth(id)
+	}
+	return true
+}
+
 // Executor returns the registered provider executor for a provider key.
 func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 	if m == nil {

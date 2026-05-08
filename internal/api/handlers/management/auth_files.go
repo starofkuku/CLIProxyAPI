@@ -244,6 +244,12 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+	if refresh := strings.ToLower(strings.TrimSpace(c.Query("refresh"))); refresh == "1" || refresh == "true" || refresh == "yes" || refresh == "on" {
+		if err := h.authManager.Load(c.Request.Context()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to refresh auth files: %v", err)})
+			return
+		}
+	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
@@ -695,7 +701,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					return
 				}
 				deleted++
-				h.disableAuth(ctx, full)
+				h.removeAuthFromManager(name, full)
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -900,12 +906,36 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.disableAuth(ctx, targetID)
-	} else {
-		h.disableAuth(ctx, targetPath)
-	}
+	h.removeAuthFromManager(name, targetID, targetPath)
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+func (h *Handler) removeAuthFromManager(candidates ...string) {
+	if h == nil || h.authManager == nil {
+		return
+	}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if h.authManager.RemoveByID(candidate) {
+			return
+		}
+		if authID := h.authIDForPath(candidate); authID != "" && h.authManager.RemoveByID(authID) {
+			return
+		}
+	}
+
+	for _, candidate := range candidates {
+		auth := h.findAuthForDelete(candidate)
+		if auth == nil {
+			continue
+		}
+		if h.authManager.RemoveByID(strings.TrimSpace(auth.ID)) {
+			return
+		}
+	}
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
