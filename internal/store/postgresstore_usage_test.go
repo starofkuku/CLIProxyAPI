@@ -11,6 +11,8 @@ import (
 func TestUsageDetailRecordsRoundTrip(t *testing.T) {
 	ts1 := time.Date(2026, 3, 18, 9, 30, 0, 0, time.UTC)
 	ts2 := time.Date(2026, 3, 18, 10, 15, 0, 0, time.UTC)
+	firstResponseAt := ts1.Add(750 * time.Millisecond)
+	completedAt := ts1.Add(2 * time.Second)
 	snapshot := usage.StatisticsSnapshot{
 		TotalRequests: 2,
 		SuccessCount:  1,
@@ -26,10 +28,13 @@ func TestUsageDetailRecordsRoundTrip(t *testing.T) {
 						TotalTokens:   42,
 						Details: []usage.RequestDetail{
 							{
-								Timestamp: ts1,
-								Source:    "openai",
-								AuthIndex: "0",
-								Failed:    false,
+								Timestamp:       ts1,
+								ClientIP:        "203.0.113.8",
+								FirstResponseAt: &firstResponseAt,
+								CompletedAt:     &completedAt,
+								Source:          "openai",
+								AuthIndex:       "0",
+								Failed:          false,
 								Tokens: usage.TokenStats{
 									InputTokens:  10,
 									OutputTokens: 5,
@@ -94,6 +99,16 @@ func TestUsageDetailRecordsRoundTrip(t *testing.T) {
 	}
 	if len(rebuiltModel.Details) != 2 {
 		t.Fatalf("details len = %d, want 2", len(rebuiltModel.Details))
+	}
+	firstDetail := rebuiltModel.Details[0]
+	if firstDetail.ClientIP != "203.0.113.8" {
+		t.Fatalf("client_ip = %q, want %q", firstDetail.ClientIP, "203.0.113.8")
+	}
+	if firstDetail.FirstResponseAt == nil || !firstDetail.FirstResponseAt.Equal(firstResponseAt) {
+		t.Fatalf("first_response_at = %v, want %v", firstDetail.FirstResponseAt, firstResponseAt)
+	}
+	if firstDetail.CompletedAt == nil || !firstDetail.CompletedAt.Equal(completedAt) {
+		t.Fatalf("completed_at = %v, want %v", firstDetail.CompletedAt, completedAt)
 	}
 	if rebuilt.RequestsByHour["09"] != 1 || rebuilt.RequestsByHour["10"] != 1 {
 		t.Fatalf("RequestsByHour = %#v, want 09=1 and 10=1", rebuilt.RequestsByHour)

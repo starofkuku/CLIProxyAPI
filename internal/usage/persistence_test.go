@@ -165,14 +165,20 @@ func TestLoggerPluginDirectWrite(t *testing.T) {
 	ginCtx, _ := gin.CreateTestContext(rec)
 	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	ginCtx.Set("apiKey", "sk-test-123")
+	requestedAt := time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC)
+	firstResponseAt := requestedAt.Add(600 * time.Millisecond)
+	completedAt := requestedAt.Add(2 * time.Second)
 
 	plugin.HandleUsage(context.WithValue(context.Background(), "gin", ginCtx), coreusage.Record{
-		Provider:    "openai",
-		Model:       "gpt-5",
-		APIKey:      "sk-test-123",
-		AuthIndex:   "0",
-		Source:      "openai",
-		RequestedAt: time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC),
+		Provider:        "openai",
+		Model:           "gpt-5",
+		APIKey:          "sk-test-123",
+		AuthIndex:       "0",
+		Source:          "openai",
+		RequestedAt:     requestedAt,
+		ClientIP:        "203.0.113.8",
+		FirstResponseAt: firstResponseAt,
+		CompletedAt:     completedAt,
 		Detail: coreusage.Detail{
 			InputTokens:  8,
 			OutputTokens: 4,
@@ -196,5 +202,14 @@ func TestLoggerPluginDirectWrite(t *testing.T) {
 	}
 	if writer.records[0].Tokens.TotalTokens != 12 {
 		t.Fatalf("TotalTokens = %d, want 12", writer.records[0].Tokens.TotalTokens)
+	}
+	if writer.records[0].ClientIP != "203.0.113.8" {
+		t.Fatalf("ClientIP = %q, want %q", writer.records[0].ClientIP, "203.0.113.8")
+	}
+	if !writer.records[0].FirstResponseAt.Equal(firstResponseAt) {
+		t.Fatalf("FirstResponseAt = %v, want %v", writer.records[0].FirstResponseAt, firstResponseAt)
+	}
+	if !writer.records[0].CompletedAt.Equal(completedAt) {
+		t.Fatalf("CompletedAt = %v, want %v", writer.records[0].CompletedAt, completedAt)
 	}
 }

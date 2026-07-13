@@ -36,15 +36,18 @@ type RecordWriter interface {
 }
 
 type PersistentRecord struct {
-	APIName     string
-	APIKeyHash  string
-	ModelName   string
-	RequestedAt time.Time
-	LatencyMs   int64
-	Source      string
-	AuthIndex   string
-	Failed      bool
-	Tokens      TokenStats
+	APIName         string
+	APIKeyHash      string
+	ModelName       string
+	RequestedAt     time.Time
+	ClientIP        string
+	FirstResponseAt time.Time
+	CompletedAt     time.Time
+	LatencyMs       int64
+	Source          string
+	AuthIndex       string
+	Failed          bool
+	Tokens          TokenStats
 }
 
 var (
@@ -134,12 +137,15 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms,omitempty"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp       time.Time  `json:"timestamp"`
+	ClientIP        string     `json:"client_ip,omitempty"`
+	FirstResponseAt *time.Time `json:"first_response_at,omitempty"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
+	LatencyMs       int64      `json:"latency_ms,omitempty"`
+	Source          string     `json:"source"`
+	AuthIndex       string     `json:"auth_index"`
+	Tokens          TokenStats `json:"tokens"`
+	Failed          bool       `json:"failed"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -286,12 +292,15 @@ func (s *RequestStatistics) recordPersistent(record PersistentRecord) {
 		s.apis[record.APIName] = stats
 	}
 	s.updateAPIStats(stats, record.ModelName, RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: record.LatencyMs,
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Tokens:    record.Tokens,
-		Failed:    record.Failed,
+		Timestamp:       timestamp,
+		ClientIP:        record.ClientIP,
+		FirstResponseAt: timePointer(record.FirstResponseAt),
+		CompletedAt:     timePointer(record.CompletedAt),
+		LatencyMs:       record.LatencyMs,
+		Source:          record.Source,
+		AuthIndex:       record.AuthIndex,
+		Tokens:          record.Tokens,
+		Failed:          record.Failed,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -577,17 +586,36 @@ func normalisePersistentRecord(ctx context.Context, record coreusage.Record) Per
 	if modelName == "" {
 		modelName = "unknown"
 	}
-	return PersistentRecord{
-		APIName:     statsKey,
-		APIKeyHash:  hashAPIKey(record.APIKey),
-		ModelName:   modelName,
-		RequestedAt: timestamp,
-		LatencyMs:   normaliseLatency(record.Latency),
-		Source:      record.Source,
-		AuthIndex:   record.AuthIndex,
-		Failed:      failed,
-		Tokens:      normaliseDetail(record.Detail),
+	firstResponseAt := record.FirstResponseAt
+	if firstResponseAt.IsZero() && record.TTFT > 0 {
+		firstResponseAt = timestamp.Add(record.TTFT)
 	}
+	completedAt := record.CompletedAt
+	if completedAt.IsZero() && record.Latency > 0 {
+		completedAt = timestamp.Add(record.Latency)
+	}
+	return PersistentRecord{
+		APIName:         statsKey,
+		APIKeyHash:      hashAPIKey(record.APIKey),
+		ModelName:       modelName,
+		RequestedAt:     timestamp,
+		ClientIP:        strings.TrimSpace(record.ClientIP),
+		FirstResponseAt: firstResponseAt,
+		CompletedAt:     completedAt,
+		LatencyMs:       normaliseLatency(record.Latency),
+		Source:          record.Source,
+		AuthIndex:       record.AuthIndex,
+		Failed:          failed,
+		Tokens:          normaliseDetail(record.Detail),
+	}
+}
+
+func timePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	copyValue := value
+	return &copyValue
 }
 
 func formatHour(hour int) string {

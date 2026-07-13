@@ -18,6 +18,9 @@ type usageDetailRecord struct {
 	APIKeyHash      string
 	ModelName       string
 	RequestedAt     time.Time
+	ClientIP        string
+	FirstResponseAt sql.NullTime
+	CompletedAt     sql.NullTime
 	Source          string
 	AuthIndex       string
 	Failed          bool
@@ -47,19 +50,23 @@ func (s *PostgresStore) AppendUsageRecord(ctx context.Context, record usage.Pers
 		requestedAt = time.Now()
 	}
 	detail := usage.RequestDetail{
-		Timestamp: requestedAt,
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Failed:    record.Failed,
-		Tokens:    normalizeUsageTokens(record.Tokens),
+		Timestamp:       requestedAt,
+		ClientIP:        record.ClientIP,
+		FirstResponseAt: usageTimePointer(record.FirstResponseAt),
+		CompletedAt:     usageTimePointer(record.CompletedAt),
+		Source:          record.Source,
+		AuthIndex:       record.AuthIndex,
+		Failed:          record.Failed,
+		Tokens:          normalizeUsageTokens(record.Tokens),
 	}
 	query := fmt.Sprintf(`
 		INSERT INTO %s (
-			dedup_key, api_name, api_key_hash, model_name, requested_at, source, auth_index, failed,
+			dedup_key, api_name, api_key_hash, model_name, requested_at,
+			client_ip, first_response_at, completed_at, source, auth_index, failed,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
 			created_at, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
 		ON CONFLICT (dedup_key) DO NOTHING
 	`, s.fullTableName(s.cfg.UsageDetailTable))
 	_, err := s.db.ExecContext(
@@ -70,6 +77,9 @@ func (s *PostgresStore) AppendUsageRecord(ctx context.Context, record usage.Pers
 		record.APIKeyHash,
 		modelName,
 		requestedAt,
+		record.ClientIP,
+		detail.FirstResponseAt,
+		detail.CompletedAt,
 		record.Source,
 		record.AuthIndex,
 		record.Failed,
@@ -131,11 +141,12 @@ func (s *PostgresStore) PersistUsageSnapshot(ctx context.Context, snapshot []byt
 
 	insertQuery := fmt.Sprintf(`
 		INSERT INTO %s (
-			dedup_key, api_name, api_key_hash, model_name, requested_at, source, auth_index, failed,
+			dedup_key, api_name, api_key_hash, model_name, requested_at,
+			client_ip, first_response_at, completed_at, source, auth_index, failed,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
 			created_at, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
 		ON CONFLICT (dedup_key) DO NOTHING
 	`, s.fullTableName(s.cfg.UsageDetailTable))
 	for _, record := range records {
@@ -147,6 +158,9 @@ func (s *PostgresStore) PersistUsageSnapshot(ctx context.Context, snapshot []byt
 			record.APIKeyHash,
 			record.ModelName,
 			record.RequestedAt,
+			record.ClientIP,
+			nullableTimeValue(record.FirstResponseAt),
+			nullableTimeValue(record.CompletedAt),
 			record.Source,
 			record.AuthIndex,
 			record.Failed,
@@ -210,7 +224,8 @@ func (s *PostgresStore) loadUsageSnapshot(ctx context.Context, start, end time.T
 
 	query := fmt.Sprintf(`
 		SELECT
-			dedup_key, api_name, api_key_hash, model_name, requested_at, source, auth_index, failed,
+			dedup_key, api_name, api_key_hash, model_name, requested_at,
+			client_ip, first_response_at, completed_at, source, auth_index, failed,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens
 		FROM %s
 		%s
@@ -231,6 +246,9 @@ func (s *PostgresStore) loadUsageSnapshot(ctx context.Context, start, end time.T
 			&record.APIKeyHash,
 			&record.ModelName,
 			&record.RequestedAt,
+			&record.ClientIP,
+			&record.FirstResponseAt,
+			&record.CompletedAt,
 			&record.Source,
 			&record.AuthIndex,
 			&record.Failed,
@@ -544,6 +562,9 @@ func usageDetailRecordsFromSnapshot(snapshot usage.StatisticsSnapshot) []usageDe
 					APIKeyHash:      "",
 					ModelName:       modelName,
 					RequestedAt:     detail.Timestamp,
+					ClientIP:        detail.ClientIP,
+					FirstResponseAt: nullableTime(detail.FirstResponseAt),
+					CompletedAt:     nullableTime(detail.CompletedAt),
 					Source:          detail.Source,
 					AuthIndex:       detail.AuthIndex,
 					Failed:          detail.Failed,
@@ -587,11 +608,14 @@ func usageSnapshotFromDetailRecords(records []usageDetailRecord) usage.Statistic
 		}
 		tokens = normalizeUsageTokens(tokens)
 		detail := usage.RequestDetail{
-			Timestamp: record.RequestedAt,
-			Source:    record.Source,
-			AuthIndex: record.AuthIndex,
-			Failed:    record.Failed,
-			Tokens:    tokens,
+			Timestamp:       record.RequestedAt,
+			ClientIP:        record.ClientIP,
+			FirstResponseAt: nullableTimePointer(record.FirstResponseAt),
+			CompletedAt:     nullableTimePointer(record.CompletedAt),
+			Source:          record.Source,
+			AuthIndex:       record.AuthIndex,
+			Failed:          record.Failed,
+			Tokens:          tokens,
 		}
 
 		snapshot.TotalRequests++
@@ -653,4 +677,34 @@ func normalizeUsageTokens(tokens usage.TokenStats) usage.TokenStats {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
 	}
 	return tokens
+}
+
+func usageTimePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	copyValue := value
+	return &copyValue
+}
+
+func nullableTime(value *time.Time) sql.NullTime {
+	if value == nil || value.IsZero() {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: *value, Valid: true}
+}
+
+func nullableTimeValue(value sql.NullTime) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.Time
+}
+
+func nullableTimePointer(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	copyValue := value.Time
+	return &copyValue
 }

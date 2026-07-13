@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"reflect"
 	"strings"
@@ -22,23 +23,25 @@ import (
 )
 
 type UsageReporter struct {
-	provider     string
-	executorType string
-	model        string
-	alias        string
-	authID       string
-	authIndex    string
-	authType     string
-	apiKey       string
-	source       string
-	reasoning    string
-	serviceTier  string
-	requestedAt  time.Time
-	ttftMu       sync.RWMutex
-	ttft         time.Duration
-	ttftStart    time.Time
-	ttftSet      bool
-	once         sync.Once
+	provider        string
+	executorType    string
+	model           string
+	alias           string
+	authID          string
+	authIndex       string
+	authType        string
+	apiKey          string
+	source          string
+	reasoning       string
+	serviceTier     string
+	requestedAt     time.Time
+	clientIP        string
+	ttftMu          sync.RWMutex
+	ttft            time.Duration
+	ttftStart       time.Time
+	firstResponseAt time.Time
+	ttftSet         bool
+	once            sync.Once
 }
 
 type usageExecutor interface {
@@ -71,6 +74,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		authType:    resolveUsageAuthType(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
 		serviceTier: usage.ServiceTierFromContext(ctx),
+		clientIP:    clientIPFromContext(ctx),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -165,7 +169,8 @@ func (r *UsageReporter) MarkFirstResponseByte() {
 	if start.IsZero() {
 		return
 	}
-	r.setTTFT(time.Since(start))
+	firstResponseAt := time.Now()
+	r.setTTFT(firstResponseAt.Sub(start), firstResponseAt)
 }
 
 func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.Detail) (usage.Record, bool) {
@@ -259,6 +264,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	if r == nil {
 		return usage.Record{Model: model, Detail: detail, Failed: failed, Fail: fail}
 	}
+	completedAt := time.Now()
 	return usage.Record{
 		Provider:            r.provider,
 		ExecutorType:        r.executorType,
@@ -274,7 +280,10 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		RequestServiceTier:  r.serviceTier,
 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
 		RequestedAt:         r.requestedAt,
-		Latency:             r.latency(),
+		ClientIP:            r.clientIP,
+		FirstResponseAt:     r.firstResponseTime(),
+		CompletedAt:         completedAt,
+		Latency:             r.latency(completedAt),
 		TTFT:                r.ttftDuration(),
 		Failed:              failed,
 		Fail:                fail,
@@ -312,18 +321,18 @@ func failFromErrors(errs ...error) usage.Failure {
 	return usage.Failure{}
 }
 
-func (r *UsageReporter) latency() time.Duration {
+func (r *UsageReporter) latency(completedAt time.Time) time.Duration {
 	if r == nil || r.requestedAt.IsZero() {
 		return 0
 	}
-	latency := time.Since(r.requestedAt)
+	latency := completedAt.Sub(r.requestedAt)
 	if latency < 0 {
 		return 0
 	}
 	return latency
 }
 
-func (r *UsageReporter) setTTFT(ttft time.Duration) {
+func (r *UsageReporter) setTTFT(ttft time.Duration, firstResponseAt time.Time) {
 	if r == nil {
 		return
 	}
@@ -336,9 +345,19 @@ func (r *UsageReporter) setTTFT(ttft time.Duration) {
 		return
 	}
 	r.ttft = ttft
+	r.firstResponseAt = firstResponseAt
 	r.ttftSet = true
 	r.ttftStart = time.Time{}
 	r.ttftMu.Unlock()
+}
+
+func (r *UsageReporter) firstResponseTime() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.ttftMu.RLock()
+	defer r.ttftMu.RUnlock()
+	return r.firstResponseAt
 }
 
 func (r *UsageReporter) ttftDuration() time.Duration {
@@ -399,6 +418,28 @@ func APIKeyFromContext(ctx context.Context) string {
 		default:
 			return fmt.Sprintf("%v", value)
 		}
+	}
+	return ""
+}
+
+func clientIPFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	remoteAddr := strings.TrimSpace(ginCtx.Request.RemoteAddr)
+	if remoteAddr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return strings.Trim(strings.TrimSpace(host), "[]")
+	}
+	trimmed := strings.Trim(remoteAddr, "[]")
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return ip.String()
 	}
 	return ""
 }

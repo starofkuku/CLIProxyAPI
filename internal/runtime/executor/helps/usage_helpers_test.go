@@ -4,10 +4,12 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -388,7 +390,12 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 
 func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	delay := 40 * time.Millisecond
-	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ginCtx.Request.RemoteAddr = "203.0.113.8:54321"
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
 	client := reporter.TrackHTTPClient(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			time.Sleep(delay)
@@ -418,6 +425,16 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	}
 	if got := reporter.ttftDuration(); got < delay {
 		t.Fatalf("ttft = %v, want >= %v", got, delay)
+	}
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.ClientIP != "203.0.113.8" {
+		t.Fatalf("client IP = %q, want %q", record.ClientIP, "203.0.113.8")
+	}
+	if record.FirstResponseAt.IsZero() {
+		t.Fatal("first response time is zero")
+	}
+	if record.CompletedAt.Before(record.FirstResponseAt) {
+		t.Fatalf("completed at %v is before first response at %v", record.CompletedAt, record.FirstResponseAt)
 	}
 }
 

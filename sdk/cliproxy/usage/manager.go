@@ -34,6 +34,9 @@ type Record struct {
 	// ResponseServiceTier stores the final tier reported by the upstream response.
 	ResponseServiceTier string
 	RequestedAt         time.Time
+	ClientIP            string
+	FirstResponseAt     time.Time
+	CompletedAt         time.Time
 	Latency             time.Duration
 	TTFT                time.Duration
 	Failed              bool

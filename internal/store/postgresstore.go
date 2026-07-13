@@ -170,6 +170,9 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 			api_key_hash TEXT NOT NULL DEFAULT '',
 			model_name TEXT NOT NULL,
 			requested_at TIMESTAMPTZ NOT NULL,
+			client_ip TEXT NOT NULL DEFAULT '',
+			first_response_at TIMESTAMPTZ,
+			completed_at TIMESTAMPTZ,
 			source TEXT NOT NULL DEFAULT '',
 			auth_index TEXT NOT NULL DEFAULT '',
 			failed BOOLEAN NOT NULL DEFAULT FALSE,
@@ -189,6 +192,24 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		usageDetailTable,
 	)); err != nil {
 		return fmt.Errorf("postgres store: alter usage detail table add api_key_hash: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS client_ip TEXT NOT NULL DEFAULT ''",
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: alter usage detail table add client_ip: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS first_response_at TIMESTAMPTZ",
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: alter usage detail table add first_response_at: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ",
+		usageDetailTable,
+	)); err != nil {
+		return fmt.Errorf("postgres store: alter usage detail table add completed_at: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
 		"CREATE INDEX IF NOT EXISTS %s ON %s (requested_at)",
