@@ -6,7 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 COPY go.mod go.sum ./
 
-RUN go mod download
+ARG GOPROXY=https://goproxy.cn,direct
+
+RUN GOPROXY="${GOPROXY}" go mod download
 
 COPY . .
 
