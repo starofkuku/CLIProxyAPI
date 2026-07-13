@@ -178,7 +178,7 @@ func TestDeleteAuthFile_DoesNotPersistDisabledRecordBackToStore(t *testing.T) {
 	}
 }
 
-func TestListAuthFiles_RefreshReloadsFromStore(t *testing.T) {
+func TestRefreshAuthFilesReloadsFromStore(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -231,9 +231,17 @@ func TestListAuthFiles_RefreshReloadsFromStore(t *testing.T) {
 
 	refreshRec := httptest.NewRecorder()
 	refreshCtx, _ := gin.CreateTestContext(refreshRec)
-	refreshCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?refresh=1", nil)
-	h.ListAuthFiles(refreshCtx)
-	assertAuthFileNames(t, refreshRec.Body.Bytes(), "beta.json")
+	refreshCtx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh", nil)
+	h.RefreshAuthFiles(refreshCtx)
+	if refreshRec.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d, want %d", refreshRec.Code, http.StatusOK)
+	}
+
+	afterRec := httptest.NewRecorder()
+	afterCtx, _ := gin.CreateTestContext(afterRec)
+	afterCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+	h.ListAuthFiles(afterCtx)
+	assertAuthFileNames(t, afterRec.Body.Bytes(), "beta.json")
 }
 
 func assertAuthFileNames(t *testing.T, body []byte, want ...string) {

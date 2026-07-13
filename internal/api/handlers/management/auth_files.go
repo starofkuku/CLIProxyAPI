@@ -346,6 +346,21 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	h.writeCompressedJSON(c, http.StatusOK, gin.H{"files": files})
 }
 
+// RefreshAuthFiles reloads the authentication manager from its configured store.
+func (h *Handler) RefreshAuthFiles(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager != nil {
+		if err := h.authManager.Load(c.Request.Context()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to refresh auth files: %v", err)})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	name := c.Query("name")
