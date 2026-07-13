@@ -522,9 +522,12 @@ func main() {
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	if usePostgresStore && pgStoreInst != nil {
 		usage.SetUsageRecordWriter(pgStoreInst)
+		usage.SetRecentUsageCacheLoader(pgStoreInst)
 	} else {
 		usage.SetUsageRecordWriter(nil)
+		usage.SetRecentUsageCacheLoader(nil)
 	}
+	usage.SetRecentUsageCacheEnabled(cfg.ManagementPerformance.UsageRecentCacheEnabled)
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {

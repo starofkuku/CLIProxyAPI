@@ -76,6 +76,7 @@ func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 	}
 	normalized := normalisePersistentRecord(ctx, record)
 	p.stats.recordPersistent(normalized)
+	GetRecentUsageCache().Record(normalized)
 	if writer := GetUsageRecordWriter(); writer != nil {
 		persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -376,6 +377,69 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	for hour, v := range s.tokensByHour {
 		key := formatHour(hour)
 		result.TokensByHour[key] = v
+	}
+
+	return result
+}
+
+// SnapshotRange returns a snapshot containing only details in the half-open interval [start, end).
+func (s *RequestStatistics) SnapshotRange(start, end time.Time) StatisticsSnapshot {
+	result := StatisticsSnapshot{
+		APIs:           make(map[string]APISnapshot),
+		RequestsByDay:  make(map[string]int64),
+		RequestsByHour: make(map[string]int64),
+		TokensByDay:    make(map[string]int64),
+		TokensByHour:   make(map[string]int64),
+	}
+	if s == nil {
+		return result
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for apiName, stats := range s.apis {
+		if stats == nil {
+			continue
+		}
+		apiSnapshot := APISnapshot{Models: make(map[string]ModelSnapshot)}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				continue
+			}
+			modelSnapshot := ModelSnapshot{}
+			for _, detail := range modelStatsValue.Details {
+				if !detailInTimeRange(detail.Timestamp, start, end) {
+					continue
+				}
+				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				modelSnapshot.Details = append(modelSnapshot.Details, detail)
+				modelSnapshot.TotalRequests++
+				modelSnapshot.TotalTokens += detail.Tokens.TotalTokens
+				apiSnapshot.TotalRequests++
+				apiSnapshot.TotalTokens += detail.Tokens.TotalTokens
+				result.TotalRequests++
+				if detail.Failed {
+					result.FailureCount++
+				} else {
+					result.SuccessCount++
+				}
+				result.TotalTokens += detail.Tokens.TotalTokens
+
+				dayKey := detail.Timestamp.Format("2006-01-02")
+				hourKey := formatHour(detail.Timestamp.Hour())
+				result.RequestsByDay[dayKey]++
+				result.RequestsByHour[hourKey]++
+				result.TokensByDay[dayKey] += detail.Tokens.TotalTokens
+				result.TokensByHour[hourKey] += detail.Tokens.TotalTokens
+			}
+			if modelSnapshot.TotalRequests > 0 {
+				apiSnapshot.Models[modelName] = modelSnapshot
+			}
+		}
+		if apiSnapshot.TotalRequests > 0 {
+			result.APIs[apiName] = apiSnapshot
+		}
 	}
 
 	return result

@@ -9,9 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func writeCompressedJSON(c *gin.Context, status int, payload any) {
+func (h *Handler) writeCompressedJSON(c *gin.Context, status int, payload any) {
 	c.Header("Vary", "Accept-Encoding")
-	if !acceptsGzip(c.GetHeader("Accept-Encoding")) {
+	if !h.managementGzipEnabled() || !acceptsGzip(c.GetHeader("Accept-Encoding")) {
 		c.JSON(status, payload)
 		return
 	}
@@ -31,6 +31,18 @@ func writeCompressedJSON(c *gin.Context, status int, payload any) {
 	if errClose := w.Close(); errClose != nil {
 		_ = c.Error(errClose)
 	}
+}
+
+func (h *Handler) managementGzipEnabled() bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return true
+	}
+	return h.cfg.ManagementPerformance.IsGzipEnabled()
 }
 
 func acceptsGzip(value string) bool {

@@ -67,6 +67,11 @@ func (h *Handler) loadUsageSnapshotRange(ctx context.Context, flush bool, start,
 	}
 
 	if filterByTime {
+		if h.recentUsageCache != nil {
+			if cached, ok := h.recentUsageCache.SnapshotRange(start, end); ok {
+				return cached, nil
+			}
+		}
 		if loader, ok := h.tokenStore.(usageSnapshotRangeLoader); ok {
 			raw, err := loader.LoadUsageSnapshotRange(ctx, start, end)
 			if err != nil {
@@ -147,7 +152,7 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
 	}
-	writeCompressedJSON(c, http.StatusOK, payload)
+	h.writeCompressedJSON(c, http.StatusOK, payload)
 }
 
 func parseUsageTimeRange(c *gin.Context) (time.Time, time.Time, bool, error) {
@@ -270,6 +275,7 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		usage.ReloadRecentUsageCacheAsync()
 		snapshot := stats.Snapshot()
 		c.JSON(http.StatusOK, gin.H{
 			"added":           result.Added,
@@ -286,6 +292,7 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 	}
 
 	result := h.usageStats.MergeSnapshot(payload.Usage)
+	usage.ReloadRecentUsageCacheAsync()
 	snapshot := h.usageStats.Snapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"added":           result.Added,
@@ -358,6 +365,7 @@ func (h *Handler) MigrateLegacyUsageStatistics(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	usage.ReloadRecentUsageCacheAsync()
 
 	snapshot, errLoad := h.loadUsageSnapshot(c.Request.Context(), false)
 	if errLoad != nil {

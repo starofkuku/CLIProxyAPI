@@ -49,6 +49,7 @@ type Handler struct {
 	failedAttempts          map[string]*attemptInfo // keyed by client IP
 	authManager             *coreauth.Manager
 	usageStats              *usage.RequestStatistics
+	recentUsageCache        *usage.RecentUsageCache
 	tokenStore              coreauth.Store
 	localPassword           string
 	allowRemoteOverride     bool
@@ -81,6 +82,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
 		usageStats:          usage.GetRequestStatistics(),
+		recentUsageCache:    usage.GetRecentUsageCache(),
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,

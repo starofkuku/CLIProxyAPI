@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
@@ -25,6 +27,11 @@ type fakeUsageMigrationStore struct {
 
 type fakeUsageSnapshotStore struct {
 	raw []byte
+}
+
+type fakeUsageRangeStore struct {
+	raw        []byte
+	rangeCalls int
 }
 
 func (f *fakeUsageMigrationStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
@@ -55,6 +62,16 @@ func (f *fakeUsageSnapshotStore) LoadUsageSnapshot(context.Context) ([]byte, err
 func (f *fakeUsageSnapshotStore) PersistUsageSnapshot(_ context.Context, snapshot []byte) error {
 	f.raw = append(f.raw[:0], snapshot...)
 	return nil
+}
+
+func (f *fakeUsageRangeStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
+func (f *fakeUsageRangeStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	return "", nil
+}
+func (f *fakeUsageRangeStore) Delete(context.Context, string) error { return nil }
+func (f *fakeUsageRangeStore) LoadUsageSnapshotRange(context.Context, time.Time, time.Time) ([]byte, error) {
+	f.rangeCalls++
+	return f.raw, nil
 }
 
 func TestGetUsageStatistics_UsesStoreSnapshot(t *testing.T) {
@@ -93,6 +110,75 @@ func TestGetUsageStatistics_UsesStoreSnapshot(t *testing.T) {
 	}
 	if body.Usage.TotalRequests != 3 {
 		t.Fatalf("TotalRequests = %d, want 3", body.Usage.TotalRequests)
+	}
+}
+
+func TestGetUsageStatistics_UsesRecentCacheForEligibleRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := time.Now()
+	loadedSnapshot := usage.StatisticsSnapshot{
+		APIs: map[string]usage.APISnapshot{
+			"codex": {
+				Models: map[string]usage.ModelSnapshot{
+					"gpt-test": {
+						Details: []usage.RequestDetail{{
+							Timestamp: now,
+							Tokens:    usage.TokenStats{TotalTokens: 9},
+						}},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(loadedSnapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	store := &fakeUsageRangeStore{raw: raw}
+	cache := usage.NewRecentUsageCache()
+	cache.SetLoader(store)
+	cache.SetEnabled(true)
+	defer cache.SetEnabled(false)
+	deadline := time.Now().Add(2 * time.Second)
+	for !cache.Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !cache.Ready() {
+		t.Fatal("recent cache did not become ready")
+	}
+	warmupCalls := store.rangeCalls
+
+	handler := &Handler{
+		usageStats:       usage.NewRequestStatistics(),
+		tokenStore:       store,
+		recentUsageCache: cache,
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	start := now.In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02")
+	c.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/v0/management/usage?from="+url.QueryEscape(start)+"&to="+
+			url.QueryEscape(now.Add(time.Second).Format(time.RFC3339Nano)),
+		nil,
+	)
+	handler.GetUsageStatistics(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if store.rangeCalls != warmupCalls {
+		t.Fatalf("range loader calls = %d, want %d after cache hit", store.rangeCalls, warmupCalls)
+	}
+	var body struct {
+		Usage usage.StatisticsSnapshot `json:"usage"`
+	}
+	if err = json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.Usage.TotalRequests != 1 {
+		t.Fatalf("TotalRequests = %d, want 1", body.Usage.TotalRequests)
 	}
 }
 
@@ -162,6 +248,31 @@ func TestGetUsageStatistics_GzipDisabledByQualityZero(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
 	c.Request.Header.Set("Accept-Encoding", "gzip;q=0, *;q=1")
+
+	handler.GetUsageStatistics(c)
+
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty", got)
+	}
+	if !json.Valid(w.Body.Bytes()) {
+		t.Fatalf("response is not plain JSON: %q", w.Body.String())
+	}
+}
+
+func TestGetUsageStatistics_GzipDisabledByConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	gzipEnabled := false
+	handler := &Handler{
+		cfg: &config.Config{ManagementPerformance: config.ManagementPerformanceConfig{
+			GzipEnabled: &gzipEnabled,
+		}},
+		usageStats: usage.NewRequestStatistics(),
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	c.Request.Header.Set("Accept-Encoding", "gzip")
 
 	handler.GetUsageStatistics(c)
 

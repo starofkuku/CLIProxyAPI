@@ -103,6 +103,9 @@ type Config struct {
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
 
+	// ManagementPerformance configures management API response and recent usage optimizations.
+	ManagementPerformance ManagementPerformanceConfig `yaml:"management-performance" json:"management-performance"`
+
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
@@ -329,6 +332,20 @@ type QuotaExceeded struct {
 	// When all free-tier auths are exhausted (429/503), the conductor retries with
 	// an auth that has available Google One AI credits.
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
+}
+
+// ManagementPerformanceConfig configures management API performance features.
+type ManagementPerformanceConfig struct {
+	// GzipEnabled allows supported management endpoints to compress JSON responses when requested.
+	GzipEnabled *bool `yaml:"gzip-enabled,omitempty" json:"gzip-enabled,omitempty"`
+
+	// UsageRecentCacheEnabled keeps yesterday and today usage details in memory using Asia/Shanghai boundaries.
+	UsageRecentCacheEnabled bool `yaml:"usage-recent-cache-enabled" json:"usage-recent-cache-enabled"`
+}
+
+// IsGzipEnabled reports whether supported management responses should use gzip.
+func (c ManagementPerformanceConfig) IsGzipEnabled() bool {
+	return c.GzipEnabled == nil || *c.GzipEnabled
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -748,6 +765,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	gzipEnabled := true
+	cfg.ManagementPerformance.GzipEnabled = &gzipEnabled
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.

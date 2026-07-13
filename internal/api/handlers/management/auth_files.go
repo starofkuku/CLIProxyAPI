@@ -343,7 +343,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	writeCompressedJSON(c, http.StatusOK, gin.H{"files": files})
+	h.writeCompressedJSON(c, http.StatusOK, gin.H{"files": files})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -455,7 +455,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			files = append(files, fileData)
 		}
 	}
-	writeCompressedJSON(c, http.StatusOK, gin.H{"files": files})
+	h.writeCompressedJSON(c, http.StatusOK, gin.H{"files": files})
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
