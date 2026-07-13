@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
@@ -41,6 +42,17 @@ func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 			}`,
 			wantHasDeveloper: true,
 			wantTexts:        []string{"Be helpful"},
+		},
+		{
+			name: "Message system role does not become developer",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"messages": [
+					{"role": "system", "content": "Follow the project instructions"},
+					{"role": "user", "content": "hello"}
+				]
+			}`,
+			wantHasDeveloper: false,
 		},
 		{
 			name: "Array system field with filtered billing header",
@@ -90,6 +102,41 @@ func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodex_MessageSystemRoleWrapsAsUserReminder(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"system": [{"type": "text", "text": "Top-level rules"}],
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{"role": "system", "content": "Follow the project instructions"},
+			{"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+			{"role": "system", "content": [{"type": "text", "text": "Use the current repo"}]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	inputs := gjson.GetBytes(result, "input").Array()
+	if len(inputs) != 5 {
+		t.Fatalf("got %d input items, want 5: %s", len(inputs), gjson.GetBytes(result, "input").Raw)
+	}
+
+	if got := inputs[0].Get("role").String(); got != "developer" {
+		t.Fatalf("top-level system role = %q, want developer", got)
+	}
+	if got := inputs[2].Get("role").String(); got != "user" {
+		t.Fatalf("message-level system role = %q, want user", got)
+	}
+	if got := inputs[2].Get("content.0.text").String(); got != "<system-reminder>\nFollow the project instructions\n</system-reminder>" {
+		t.Fatalf("unexpected first reminder text: %q", got)
+	}
+	if got := inputs[4].Get("role").String(); got != "user" {
+		t.Fatalf("array message-level system role = %q, want user", got)
+	}
+	if got := inputs[4].Get("content.0.text").String(); got != "<system-reminder>\nUse the current repo\n</system-reminder>" {
+		t.Fatalf("unexpected second reminder text: %q", got)
+	}
+}
+
 func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -133,6 +180,108 @@ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 				t.Fatalf("parallel_tool_calls = %v, want %v. Output: %s", got, tt.wantParallelToolCalls, string(result))
 			}
 		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ServiceTier(t *testing.T) {
+	tests := []struct {
+		name            string
+		serviceTierJSON string
+		want            string
+		wantExists      bool
+	}{
+		{
+			name:            "Priority passes through",
+			serviceTierJSON: `"priority"`,
+			want:            "priority",
+			wantExists:      true,
+		},
+		{
+			name:            "Fast normalizes to priority",
+			serviceTierJSON: `"fast"`,
+			want:            "priority",
+			wantExists:      true,
+		},
+		{
+			name:            "Unsupported tier is omitted",
+			serviceTierJSON: `"default"`,
+		},
+		{
+			name:            "Non-string tier is omitted",
+			serviceTierJSON: `true`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputJSON := `{
+				"model": "gpt-5.4",
+				"service_tier": ` + tt.serviceTierJSON + `,
+				"messages": [{"role": "user", "content": "Reply with OK"}]
+			}`
+
+			result := ConvertClaudeRequestToCodex("gpt-5.4", []byte(inputJSON), false)
+			serviceTierResult := gjson.GetBytes(result, "service_tier")
+			if serviceTierResult.Exists() != tt.wantExists {
+				t.Fatalf("service_tier exists = %v, want %v. Output: %s", serviceTierResult.Exists(), tt.wantExists, string(result))
+			}
+			if !tt.wantExists {
+				return
+			}
+			if got := serviceTierResult.String(); got != tt.want {
+				t.Fatalf("service_tier = %q, want %q. Output: %s", got, tt.want, string(result))
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ShortenLongToolUseIDs(t *testing.T) {
+	longID := "toolu_" + strings.Repeat("a", 62)
+	if len(longID) <= 64 {
+		t.Fatalf("test setup error: longID length = %d, want > 64", len(longID))
+	}
+
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role": "user", "content": [{"type":"text","text":"run pwd"}]},
+			{"role": "assistant", "content": [
+				{"type":"tool_use","id":"` + longID + `","name":"Bash","input":{"cmd":"pwd"}}
+			]},
+			{"role": "user", "content": [
+				{"type":"tool_result","tool_use_id":"` + longID + `","content":"ok"}
+			]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	inputs := gjson.GetBytes(result, "input").Array()
+
+	var callID string
+	var outputCallID string
+	for _, item := range inputs {
+		switch item.Get("type").String() {
+		case "function_call":
+			callID = item.Get("call_id").String()
+		case "function_call_output":
+			outputCallID = item.Get("call_id").String()
+		}
+	}
+
+	if callID == "" {
+		t.Fatalf("missing function_call item. Output: %s", string(result))
+	}
+	if outputCallID == "" {
+		t.Fatalf("missing function_call_output item. Output: %s", string(result))
+	}
+	if callID != outputCallID {
+		t.Fatalf("call_id mismatch: function_call=%q function_call_output=%q. Output: %s", callID, outputCallID, string(result))
+	}
+	if len(callID) > 64 {
+		t.Fatalf("call_id length = %d, want <= 64: %q", len(callID), callID)
+	}
+	if callID == longID {
+		t.Fatalf("long call_id was not shortened: %q", callID)
 	}
 }
 
@@ -329,6 +478,36 @@ func TestConvertClaudeRequestToCodex_AssistantThinkingSignatureToReasoningItem(t
 	}
 	if strings.Contains(string(result), "visible summary must not be replayed") {
 		t.Fatalf("thinking text should not be replayed into Codex input. Output: %s", string(result))
+	}
+}
+
+func TestConvertClaudeRequestToCodex_AssistantGrokSignatureToReasoningItem(t *testing.T) {
+	signature := "HmlYdr2aCAqCYP/m9mr8PS6KOsdMs72FGDigmydR+Jsmuv8KX97yWPlbOwmXJgWn0CbHaCacdQD3+n5EvpgLfPNmafS3kdICBjRuDf4bzHy7uBiUhNVhqPtp/ee1y9q4imPE4LYgD1VZ4J+bp9mTeqA1+nC9Oue58CiNEMV9SVaGenCD+aBnVuSTzQhD32Y+68i6HLJW0Dx6ifaRfb8hxYtA/sPM+/FTvAMW11nRho5a2BBSkpnzfqqAz/e/vGJ77/bygpXM823QA9wL9i0X"
+	payload := []byte(`{"model":"grok-4.5","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = sjson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	out := ConvertClaudeRequestToCodex("grok-4.5", payload, false)
+	reasoning := gjson.GetBytes(out, "input.0")
+	if reasoning.Get("type").String() != "reasoning" {
+		t.Fatalf("input.0 type = %q, want reasoning; output=%s", reasoning.Get("type").String(), out)
+	}
+	if got := reasoning.Get("encrypted_content").String(); got != signature {
+		t.Fatalf("encrypted_content = %q, want Grok signature", got)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets(t *testing.T) {
+	signature := "HmlYdr2aCAqCYP/m9mr8PS6KOsdMs72FGDigmydR+Jsmuv8KX97yWPlbOwmXJgWn0CbHaCacdQD3+n5EvpgLfPNmafS3kdICBjRuDf4bzHy7uBiUhNVhqPtp/ee1y9q4imPE4LYgD1VZ4J+bp9mTeqA1+nC9Oue58CiNEMV9SVaGenCD+aBnVuSTzQhD32Y+68i6HLJW0Dx6ifaRfb8hxYtA/sPM+/FTvAMW11nRho5a2BBSkpnzfqqAz/e/vGJ77/bygpXM823QA9wL9i0X"
+	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = sjson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	for _, modelName := range []string{"gpt-5.4", "claude-sonnet-4-6"} {
+		t.Run(modelName, func(t *testing.T) {
+			out := ConvertClaudeRequestToCodex(modelName, payload, false)
+			if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+				t.Fatalf("got %d reasoning items for non-Grok target, want 0; output=%s", got, out)
+			}
+		})
 	}
 }
 

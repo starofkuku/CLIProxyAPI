@@ -3,6 +3,7 @@ package redisqueue
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"time"
 
@@ -41,12 +42,28 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	if provider == "" {
 		provider = "unknown"
 	}
+	executorType := strings.TrimSpace(record.ExecutorType)
+	if executorType == "" {
+		executorType = "unknown"
+	}
 	authType := strings.TrimSpace(record.AuthType)
 	if authType == "" {
 		authType = "unknown"
 	}
 	apiKey := strings.TrimSpace(record.APIKey)
 	requestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	reasoningEffort := strings.TrimSpace(record.ReasoningEffort)
+	if reasoningEffort == "" {
+		reasoningEffort = coreusage.ReasoningEffortFromContext(ctx)
+	}
+	requestServiceTier := strings.TrimSpace(record.RequestServiceTier)
+	if requestServiceTier == "" {
+		requestServiceTier = strings.TrimSpace(record.ServiceTier)
+	}
+	if requestServiceTier == "" {
+		requestServiceTier = coreusage.ServiceTierFromContext(ctx)
+	}
+	responseServiceTier := strings.TrimSpace(record.ResponseServiceTier)
 
 	tokens := tokenStats{
 		InputTokens:         record.Detail.InputTokens,
@@ -71,24 +88,31 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	fail := resolveFail(ctx, record, failed)
 
 	detail := requestDetail{
-		Timestamp: timestamp,
-		LatencyMs: record.Latency.Milliseconds(),
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Tokens:    tokens,
-		Failed:    failed,
-		Fail:      fail,
+		Timestamp:       timestamp,
+		LatencyMs:       record.Latency.Milliseconds(),
+		TTFTMs:          record.TTFT.Milliseconds(),
+		Source:          record.Source,
+		AuthIndex:       record.AuthIndex,
+		Tokens:          tokens,
+		Failed:          failed,
+		Fail:            fail,
+		ResponseHeaders: record.ResponseHeaders,
 	}
 
 	payload, err := json.Marshal(queuedUsageDetail{
-		requestDetail: detail,
-		Provider:      provider,
-		Model:         modelName,
-		Alias:         aliasName,
-		Endpoint:      resolveEndpoint(ctx),
-		AuthType:      authType,
-		APIKey:        apiKey,
-		RequestID:     requestID,
+		requestDetail:       detail,
+		Provider:            provider,
+		ExecutorType:        executorType,
+		Model:               modelName,
+		Alias:               aliasName,
+		Endpoint:            resolveEndpoint(ctx),
+		AuthType:            authType,
+		APIKey:              apiKey,
+		RequestID:           requestID,
+		ReasoningEffort:     reasoningEffort,
+		ServiceTier:         requestServiceTier,
+		RequestServiceTier:  requestServiceTier,
+		ResponseServiceTier: responseServiceTier,
 	})
 	if err != nil {
 		return
@@ -98,23 +122,30 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 
 type queuedUsageDetail struct {
 	requestDetail
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	Alias     string `json:"alias"`
-	Endpoint  string `json:"endpoint"`
-	AuthType  string `json:"auth_type"`
-	APIKey    string `json:"api_key"`
-	RequestID string `json:"request_id"`
+	Provider            string `json:"provider"`
+	ExecutorType        string `json:"executor_type"`
+	Model               string `json:"model"`
+	Alias               string `json:"alias"`
+	Endpoint            string `json:"endpoint"`
+	AuthType            string `json:"auth_type"`
+	APIKey              string `json:"api_key"`
+	RequestID           string `json:"request_id"`
+	ReasoningEffort     string `json:"reasoning_effort"`
+	ServiceTier         string `json:"service_tier"`
+	RequestServiceTier  string `json:"request_service_tier"`
+	ResponseServiceTier string `json:"response_service_tier,omitempty"`
 }
 
 type requestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    tokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
-	Fail      failDetail `json:"fail"`
+	Timestamp       time.Time   `json:"timestamp"`
+	LatencyMs       int64       `json:"latency_ms"`
+	TTFTMs          int64       `json:"ttft_ms"`
+	Source          string      `json:"source"`
+	AuthIndex       string      `json:"auth_index"`
+	Tokens          tokenStats  `json:"tokens"`
+	Failed          bool        `json:"failed"`
+	Fail            failDetail  `json:"fail"`
+	ResponseHeaders http.Header `json:"response_headers,omitempty"`
 }
 
 type tokenStats struct {
