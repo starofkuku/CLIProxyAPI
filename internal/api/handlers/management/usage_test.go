@@ -2,8 +2,10 @@ package management
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -91,6 +93,83 @@ func TestGetUsageStatistics_UsesStoreSnapshot(t *testing.T) {
 	}
 	if body.Usage.TotalRequests != 3 {
 		t.Fatalf("TotalRequests = %d, want 3", body.Usage.TotalRequests)
+	}
+}
+
+func TestGetUsageStatistics_GzipResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	snapshot := usage.StatisticsSnapshot{
+		TotalRequests: 3,
+		SuccessCount:  2,
+		FailureCount:  1,
+		TotalTokens:   30,
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	handler := &Handler{
+		usageStats: usage.NewRequestStatistics(),
+		tokenStore: &fakeUsageMigrationStore{raw: raw},
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	c.Request.Header.Set("Accept-Encoding", "gzip, deflate, br")
+
+	handler.GetUsageStatistics(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := w.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("Vary = %q, want Accept-Encoding", got)
+	}
+
+	reader, errReader := gzip.NewReader(w.Body)
+	if errReader != nil {
+		t.Fatalf("create gzip reader: %v", errReader)
+	}
+	decompressed, errRead := io.ReadAll(reader)
+	if errRead != nil {
+		t.Fatalf("read gzip response: %v", errRead)
+	}
+	if errClose := reader.Close(); errClose != nil {
+		t.Fatalf("close gzip reader: %v", errClose)
+	}
+
+	var body struct {
+		Usage usage.StatisticsSnapshot `json:"usage"`
+	}
+	if err = json.Unmarshal(decompressed, &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.Usage.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", body.Usage.TotalRequests)
+	}
+}
+
+func TestGetUsageStatistics_GzipDisabledByQualityZero(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{usageStats: usage.NewRequestStatistics()}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	c.Request.Header.Set("Accept-Encoding", "gzip;q=0, *;q=1")
+
+	handler.GetUsageStatistics(c)
+
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty", got)
+	}
+	if !json.Valid(w.Body.Bytes()) {
+		t.Fatalf("response is not plain JSON: %q", w.Body.String())
 	}
 }
 
