@@ -94,6 +94,81 @@ func TestGetUsageStatistics_UsesStoreSnapshot(t *testing.T) {
 	}
 }
 
+func TestGetUsageStatistics_FiltersByTimeRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	inRange := time.Date(2026, 3, 18, 1, 30, 0, 0, time.UTC)
+	outOfRange := time.Date(2026, 3, 19, 1, 30, 0, 0, time.UTC)
+	snapshot := usage.StatisticsSnapshot{
+		APIs: map[string]usage.APISnapshot{
+			"api-key-1": {
+				Models: map[string]usage.ModelSnapshot{
+					"gpt-5.5": {
+						Details: []usage.RequestDetail{
+							{
+								Timestamp: inRange,
+								Source:    "openai",
+								Tokens:    usage.TokenStats{InputTokens: 6, OutputTokens: 4, TotalTokens: 10},
+							},
+							{
+								Timestamp: outOfRange,
+								Source:    "openai",
+								Tokens:    usage.TokenStats{InputTokens: 20, OutputTokens: 5, TotalTokens: 25},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	handler := &Handler{
+		usageStats: usage.NewRequestStatistics(),
+		tokenStore: &fakeUsageSnapshotStore{raw: raw},
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage?start=2026-03-18T00:00:00Z&end=2026-03-19T00:00:00Z", nil)
+
+	handler.GetUsageStatistics(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var body struct {
+		Usage usage.StatisticsSnapshot `json:"usage"`
+	}
+	if err = json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.Usage.TotalRequests != 1 {
+		t.Fatalf("TotalRequests = %d, want 1", body.Usage.TotalRequests)
+	}
+	if body.Usage.TotalTokens != 10 {
+		t.Fatalf("TotalTokens = %d, want 10", body.Usage.TotalTokens)
+	}
+}
+
+func TestGetUsageStatistics_InvalidTimeRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{usageStats: usage.NewRequestStatistics()}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage?start=2026-03-19&end=2026-03-18", nil)
+
+	handler.GetUsageStatistics(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
 func TestImportUsageStatistics_PersistsToStore(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ts := time.Date(2026, 3, 18, 13, 0, 0, 0, time.UTC)

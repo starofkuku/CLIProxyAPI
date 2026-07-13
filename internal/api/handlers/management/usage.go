@@ -40,6 +40,10 @@ type usageSnapshotLoader interface {
 	LoadUsageSnapshot(ctx context.Context) ([]byte, error)
 }
 
+type usageSnapshotRangeLoader interface {
+	LoadUsageSnapshotRange(ctx context.Context, start, end time.Time) ([]byte, error)
+}
+
 type usageSnapshotStore interface {
 	LoadUsageSnapshot(ctx context.Context) ([]byte, error)
 	PersistUsageSnapshot(ctx context.Context, snapshot []byte) error
@@ -53,9 +57,29 @@ func (r usageQueueRecord) MarshalJSON() ([]byte, error) {
 }
 
 func (h *Handler) loadUsageSnapshot(ctx context.Context, flush bool) (usage.StatisticsSnapshot, error) {
+	return h.loadUsageSnapshotRange(ctx, flush, time.Time{}, time.Time{}, false)
+}
+
+func (h *Handler) loadUsageSnapshotRange(ctx context.Context, flush bool, start, end time.Time, filterByTime bool) (usage.StatisticsSnapshot, error) {
 	var snapshot usage.StatisticsSnapshot
 	if h == nil {
 		return snapshot, nil
+	}
+
+	if filterByTime {
+		if loader, ok := h.tokenStore.(usageSnapshotRangeLoader); ok {
+			raw, err := loader.LoadUsageSnapshotRange(ctx, start, end)
+			if err != nil {
+				return snapshot, err
+			}
+			if len(strings.TrimSpace(string(raw))) == 0 {
+				return snapshot, nil
+			}
+			if err := json.Unmarshal(raw, &snapshot); err != nil {
+				return snapshot, err
+			}
+			return snapshot, nil
+		}
 	}
 
 	if store, ok := h.tokenStore.(usageSnapshotStore); ok {
@@ -74,6 +98,9 @@ func (h *Handler) loadUsageSnapshot(ctx context.Context, flush bool) (usage.Stat
 		if err := json.Unmarshal(raw, &snapshot); err != nil {
 			return snapshot, err
 		}
+		if filterByTime {
+			snapshot = usage.FilterSnapshotByTimeRange(snapshot, start, end)
+		}
 		return snapshot, nil
 	}
 
@@ -88,18 +115,30 @@ func (h *Handler) loadUsageSnapshot(ctx context.Context, flush bool) (usage.Stat
 		if err := json.Unmarshal(raw, &snapshot); err != nil {
 			return snapshot, err
 		}
+		if filterByTime {
+			snapshot = usage.FilterSnapshotByTimeRange(snapshot, start, end)
+		}
 		return snapshot, nil
 	}
 
 	if h.usageStats != nil {
-		return h.usageStats.Snapshot(), nil
+		snapshot = h.usageStats.Snapshot()
+		if filterByTime {
+			snapshot = usage.FilterSnapshotByTimeRange(snapshot, start, end)
+		}
+		return snapshot, nil
 	}
 	return snapshot, nil
 }
 
 // GetUsageStatistics returns the request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
-	snapshot, err := h.loadUsageSnapshot(c.Request.Context(), false)
+	start, end, filterByTime, errRange := parseUsageTimeRange(c)
+	if errRange != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRange.Error()})
+		return
+	}
+	snapshot, err := h.loadUsageSnapshotRange(c.Request.Context(), false, start, end, filterByTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -108,6 +147,76 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+func parseUsageTimeRange(c *gin.Context) (time.Time, time.Time, bool, error) {
+	if c == nil {
+		return time.Time{}, time.Time{}, false, nil
+	}
+	startRaw := firstQueryValue(c, "start", "from", "start_time")
+	endRaw := firstQueryValue(c, "end", "to", "end_time")
+	if startRaw == "" && endRaw == "" {
+		return time.Time{}, time.Time{}, false, nil
+	}
+
+	var start time.Time
+	var end time.Time
+	var err error
+	if startRaw != "" {
+		start, err = parseUsageBoundaryTime(startRaw)
+		if err != nil {
+			return time.Time{}, time.Time{}, false, errors.New("invalid start time")
+		}
+	}
+	if endRaw != "" {
+		end, err = parseUsageBoundaryTime(endRaw)
+		if err != nil {
+			return time.Time{}, time.Time{}, false, errors.New("invalid end time")
+		}
+	}
+	if !start.IsZero() && !end.IsZero() && !start.Before(end) {
+		return time.Time{}, time.Time{}, false, errors.New("start must be before end")
+	}
+	return start, end, true, nil
+}
+
+func firstQueryValue(c *gin.Context, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(c.Query(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseUsageBoundaryTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, errors.New("empty time")
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return ts, nil
+	}
+	if unix, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if unix > 1_000_000_000_000 {
+			return time.UnixMilli(unix), nil
+		}
+		return time.Unix(unix, 0), nil
+	}
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		loc = time.FixedZone("Asia/Shanghai", 8*60*60)
+	}
+	for _, layout := range []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+	} {
+		if ts, errParse := time.ParseInLocation(layout, value, loc); errParse == nil {
+			return ts, nil
+		}
+	}
+	return time.Time{}, errors.New("unsupported time format")
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.

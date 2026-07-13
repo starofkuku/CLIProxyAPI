@@ -166,6 +166,55 @@ type StatisticsSnapshot struct {
 	TokensByHour   map[string]int64 `json:"tokens_by_hour"`
 }
 
+// FilterSnapshotByTimeRange rebuilds a snapshot using only request details in
+// the half-open interval [start, end). A zero boundary is ignored.
+func FilterSnapshotByTimeRange(snapshot StatisticsSnapshot, start, end time.Time) StatisticsSnapshot {
+	stats := NewRequestStatistics()
+	filtered := StatisticsSnapshot{APIs: make(map[string]APISnapshot, len(snapshot.APIs))}
+	for apiName, apiSnapshot := range snapshot.APIs {
+		apiName = strings.TrimSpace(apiName)
+		if apiName == "" {
+			continue
+		}
+		filteredAPI := APISnapshot{Models: make(map[string]ModelSnapshot, len(apiSnapshot.Models))}
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelName = strings.TrimSpace(modelName)
+			if modelName == "" {
+				modelName = "unknown"
+			}
+			filteredModel := ModelSnapshot{}
+			for _, detail := range modelSnapshot.Details {
+				if !detailInTimeRange(detail.Timestamp, start, end) {
+					continue
+				}
+				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				filteredModel.Details = append(filteredModel.Details, detail)
+			}
+			if len(filteredModel.Details) > 0 {
+				filteredAPI.Models[modelName] = filteredModel
+			}
+		}
+		if len(filteredAPI.Models) > 0 {
+			filtered.APIs[apiName] = filteredAPI
+		}
+	}
+	_ = stats.MergeSnapshot(filtered)
+	return stats.Snapshot()
+}
+
+func detailInTimeRange(ts, start, end time.Time) bool {
+	if ts.IsZero() {
+		return false
+	}
+	if !start.IsZero() && ts.Before(start) {
+		return false
+	}
+	if !end.IsZero() && !ts.Before(end) {
+		return false
+	}
+	return true
+}
+
 // APISnapshot summarises metrics for a single API key.
 type APISnapshot struct {
 	TotalRequests int64                    `json:"total_requests"`

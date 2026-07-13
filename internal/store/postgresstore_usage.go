@@ -177,8 +177,35 @@ func (s *PostgresStore) PersistUsageSnapshot(ctx context.Context, snapshot []byt
 
 // LoadUsageSnapshot reconstructs the serialized usage snapshot from detail rows.
 func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) ([]byte, error) {
+	return s.loadUsageSnapshot(ctx, time.Time{}, time.Time{}, false)
+}
+
+// LoadUsageSnapshotRange reconstructs a serialized usage snapshot from detail rows
+// whose requested_at values fall in the half-open interval [start, end).
+func (s *PostgresStore) LoadUsageSnapshotRange(ctx context.Context, start, end time.Time) ([]byte, error) {
+	return s.loadUsageSnapshot(ctx, start, end, true)
+}
+
+func (s *PostgresStore) loadUsageSnapshot(ctx context.Context, start, end time.Time, filterByTime bool) ([]byte, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("postgres store: not initialized")
+	}
+
+	whereParts := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if filterByTime {
+		if !start.IsZero() {
+			args = append(args, start)
+			whereParts = append(whereParts, fmt.Sprintf("requested_at >= $%d", len(args)))
+		}
+		if !end.IsZero() {
+			args = append(args, end)
+			whereParts = append(whereParts, fmt.Sprintf("requested_at < $%d", len(args)))
+		}
+	}
+	whereClause := ""
+	if len(whereParts) > 0 {
+		whereClause = "WHERE " + strings.Join(whereParts, " AND ")
 	}
 
 	query := fmt.Sprintf(`
@@ -186,9 +213,10 @@ func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) ([]byte, error) {
 			dedup_key, api_name, api_key_hash, model_name, requested_at, source, auth_index, failed,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens
 		FROM %s
+		%s
 		ORDER BY requested_at, dedup_key
-	`, s.fullTableName(s.cfg.UsageDetailTable))
-	rows, err := s.db.QueryContext(ctx, query)
+	`, s.fullTableName(s.cfg.UsageDetailTable), whereClause)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("postgres store: load usage detail rows: %w", err)
 	}
@@ -220,7 +248,36 @@ func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("postgres store: iterate usage detail rows: %w", err)
 	}
 	if len(records) == 0 {
-		return s.loadLegacyUsageSnapshot(ctx)
+		if filterByTime {
+			hasDetails, errHasDetails := s.hasUsageDetailRows(ctx)
+			if errHasDetails != nil {
+				return nil, errHasDetails
+			}
+			if hasDetails {
+				payload, errMarshal := json.Marshal(usageSnapshotFromDetailRecords(nil))
+				if errMarshal != nil {
+					return nil, fmt.Errorf("postgres store: marshal empty usage snapshot: %w", errMarshal)
+				}
+				return payload, nil
+			}
+		}
+		raw, errLegacy := s.loadLegacyUsageSnapshot(ctx)
+		if errLegacy != nil {
+			return nil, errLegacy
+		}
+		if !filterByTime || len(strings.TrimSpace(string(raw))) == 0 {
+			return raw, nil
+		}
+		var legacy usage.StatisticsSnapshot
+		if errUnmarshal := json.Unmarshal(raw, &legacy); errUnmarshal != nil {
+			return nil, fmt.Errorf("postgres store: parse legacy usage snapshot: %w", errUnmarshal)
+		}
+		filtered := usage.FilterSnapshotByTimeRange(legacy, start, end)
+		payload, errMarshal := json.Marshal(filtered)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("postgres store: marshal filtered legacy usage snapshot: %w", errMarshal)
+		}
+		return payload, nil
 	}
 
 	payload, err := json.Marshal(usageSnapshotFromDetailRecords(records))
@@ -228,6 +285,15 @@ func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("postgres store: marshal usage snapshot: %w", err)
 	}
 	return payload, nil
+}
+
+func (s *PostgresStore) hasUsageDetailRows(ctx context.Context) (bool, error) {
+	query := fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s LIMIT 1)", s.fullTableName(s.cfg.UsageDetailTable))
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, query).Scan(&exists); err != nil {
+		return false, fmt.Errorf("postgres store: check usage detail rows: %w", err)
+	}
+	return exists, nil
 }
 
 func (s *PostgresStore) loadLegacyUsageSnapshot(ctx context.Context) ([]byte, error) {
