@@ -2296,7 +2296,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	m.auths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
-		if auth == nil || auth.ID == "" {
+		if auth == nil || auth.ID == "" || isRecycleBinAuth(auth) {
 			continue
 		}
 		auth.EnsureIndex()
@@ -2310,6 +2310,14 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Unlock()
 	m.syncScheduler()
 	return nil
+}
+
+func isRecycleBinAuth(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	_, recycled := auth.Metadata["_recycle_bin"]
+	return recycled
 }
 
 // Execute performs a non-streaming execution using the configured selector and executor.

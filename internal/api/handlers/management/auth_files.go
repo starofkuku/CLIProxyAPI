@@ -834,7 +834,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-// Delete auth files: single by name or all
+// DeleteAuthFile soft-deletes auth files by moving them to the recycle bin.
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -847,7 +847,8 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 			return
 		}
-		deleted := 0
+		deletedFiles := make([]string, 0)
+		failed := make([]gin.H, 0)
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -856,22 +857,18 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			if !strings.HasSuffix(strings.ToLower(name), ".json") {
 				continue
 			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
-				}
+			trashedName, _, errTrash := h.trashAuthFileByName(ctx, name, "manual_delete_all")
+			if errTrash != nil {
+				failed = append(failed, gin.H{"name": name, "error": errTrash.Error()})
+				continue
 			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.removeAuth(ctx, full)
-			}
+			deletedFiles = append(deletedFiles, trashedName)
 		}
-		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
+		if len(failed) > 0 {
+			c.JSON(http.StatusMultiStatus, gin.H{"status": "partial", "deleted": len(deletedFiles), "files": deletedFiles, "failed": failed})
+			return
+		}
+		c.JSON(200, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
 		return
 	}
 
@@ -885,7 +882,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	if len(names) == 1 {
-		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0]); errDelete != nil {
+		if _, status, errDelete := h.trashAuthFileByName(ctx, names[0], "manual_delete"); errDelete != nil {
 			c.JSON(status, gin.H{"error": errDelete.Error()})
 			return
 		}
@@ -896,7 +893,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	deletedFiles := make([]string, 0, len(names))
 	failed := make([]gin.H, 0)
 	for _, name := range names {
-		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		deletedName, _, errDelete := h.trashAuthFileByName(ctx, name, "manual_delete")
 		if errDelete != nil {
 			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
 			continue
