@@ -117,6 +117,48 @@ func TestRefreshTokens_DeduplicatesConcurrentRefreshAcrossInstances(t *testing.T
 	}
 }
 
+func TestRefreshTokensWithClientIDUsesCallerClientAndCodexUserAgent(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if errParse := req.ParseForm(); errParse != nil {
+					t.Fatalf("parse form: %v", errParse)
+				}
+				if req.Form.Get("client_id") != "custom-client" {
+					t.Fatalf("client_id = %q", req.Form.Get("client_id"))
+				}
+				if req.Form.Get("refresh_token") != "refresh-token" {
+					t.Fatalf("refresh_token = %q", req.Form.Get("refresh_token"))
+				}
+				if req.UserAgent() != "codex-cli/0.91.0" {
+					t.Fatalf("user agent = %q", req.UserAgent())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(`{
+						"access_token":"new-access",
+						"refresh_token":"new-refresh",
+						"expires_in":3600
+					}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+
+	tokenData, errRefresh := auth.RefreshTokensWithClientID(context.Background(), "refresh-token", "custom-client")
+	if errRefresh != nil {
+		t.Fatalf("refresh tokens: %v", errRefresh)
+	}
+	if tokenData.AccessToken != "new-access" || tokenData.RefreshToken != "new-refresh" {
+		t.Fatalf("unexpected token data: %#v", tokenData)
+	}
+}
+
 func TestNewCodexAuthWithProxyURL_OverrideDirectDisablesProxy(t *testing.T) {
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
 	auth := NewCodexAuthWithProxyURL(cfg, "direct")

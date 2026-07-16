@@ -1383,16 +1383,20 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
 	}
 	var refreshToken string
+	clientID := codexauth.ClientID
 	if auth.Metadata != nil {
 		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {
 			refreshToken = v
+		}
+		if v, ok := auth.Metadata["client_id"].(string); ok && strings.TrimSpace(v) != "" {
+			clientID = strings.TrimSpace(v)
 		}
 	}
 	if refreshToken == "" {
 		return auth, nil
 	}
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	td, err := svc.RefreshTokensWithRetryAndClientID(ctx, refreshToken, clientID, 3)
 	if err != nil {
 		return nil, err
 	}

@@ -915,6 +915,7 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthFiles)
+		mgmt.POST("/auth-files/refresh-tokens/convert", s.mgmt.ConvertCodexRefreshTokens)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
