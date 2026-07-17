@@ -2,10 +2,11 @@ package management
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -31,28 +34,46 @@ var newCodexRefreshService = func(cfg *config.Config) codexRefreshService {
 }
 
 type codexRefreshTokenConvertRequest struct {
-	RefreshTokens []string `json:"refresh_tokens"`
-	ClientID      string   `json:"client_id"`
+	RefreshTokens codexRefreshTokenInput `json:"refresh_tokens"`
+	ClientID      string                 `json:"client_id"`
 }
 
-type codexRefreshTokenConvertedFile struct {
-	Index   int            `json:"index"`
-	Name    string         `json:"name"`
-	Content map[string]any `json:"content"`
+type codexRefreshTokenInput []string
+
+func (input *codexRefreshTokenInput) UnmarshalJSON(data []byte) error {
+	var text string
+	if errText := json.Unmarshal(data, &text); errText == nil {
+		*input = []string{text}
+		return nil
+	}
+	var values []string
+	if errValues := json.Unmarshal(data, &values); errValues == nil {
+		*input = values
+		return nil
+	}
+	return fmt.Errorf("refresh_tokens must be a string or string array")
 }
 
-type codexRefreshTokenConvertFailure struct {
-	Index int    `json:"index"`
-	Error string `json:"error"`
+type codexRefreshTokenConvertedCredential struct {
+	index         int
+	tokenData     *codex.CodexTokenData
+	clientID      string
+	planType      string
+	hashAccountID string
+	metadata      map[string]any
 }
 
 type codexRefreshTokenConvertResult struct {
-	file    *codexRefreshTokenConvertedFile
-	failure *codexRefreshTokenConvertFailure
+	credential *codexRefreshTokenConvertedCredential
+	failure    error
 }
 
 // ConvertCodexRefreshTokens exchanges refresh tokens for CPA-compatible Codex credentials.
 func (h *Handler) ConvertCodexRefreshTokens(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
 	var request codexRefreshTokenConvertRequest
 	if errBind := c.ShouldBindJSON(&request); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request"})
@@ -100,30 +121,42 @@ func (h *Handler) ConvertCodexRefreshTokens(c *gin.Context) {
 	close(jobs)
 	workers.Wait()
 
-	files := make([]codexRefreshTokenConvertedFile, 0, len(results))
-	failed := make([]codexRefreshTokenConvertFailure, 0)
+	saved := 0
+	failed := 0
 	for _, result := range results {
-		if result.file != nil {
-			files = append(files, *result.file)
+		if result.failure != nil || result.credential == nil {
+			failed++
+			continue
 		}
-		if result.failure != nil {
-			failed = append(failed, *result.failure)
+		if errSave := h.saveConvertedCodexCredential(c.Request.Context(), result.credential); errSave != nil {
+			failed++
+			log.WithError(errSave).Warnf("failed to persist converted Codex credential at input index %d", result.credential.index)
+			continue
 		}
+		saved++
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"total":        len(refreshTokens),
-		"converted":    len(files),
-		"failed_count": len(failed),
-		"files":        files,
-		"failed":       failed,
+		"saved":        saved,
+		"failed_count": failed,
 	})
 }
 
 func normalizeRefreshTokens(values []string) []string {
 	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
+		normalized := strings.ReplaceAll(strings.ReplaceAll(value, "\r\n", "\n"), "\r", "\n")
+		for _, line := range strings.Split(normalized, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if _, exists := seen[trimmed]; exists {
+				continue
+			}
+			seen[trimmed] = struct{}{}
 			result = append(result, trimmed)
 		}
 	}
@@ -145,38 +178,46 @@ func convertCodexRefreshToken(parent context.Context, service codexRefreshServic
 		return refreshTokenFailure(index, refreshToken, fmt.Errorf("upstream response missing refresh_token"))
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
-	content := map[string]any{
+	lastRefresh := time.Now().UTC().Format(time.RFC3339)
+	metadata := map[string]any{
 		"type":          "codex",
+		"client_id":     clientID,
 		"access_token":  tokenData.AccessToken,
 		"refresh_token": tokenData.RefreshToken,
-		"last_refresh":  now,
-		"client_id":     clientID,
+		"last_refresh":  lastRefresh,
 	}
-	setNonEmptyString(content, "id_token", tokenData.IDToken)
-	setNonEmptyString(content, "account_id", tokenData.AccountID)
-	setNonEmptyString(content, "chatgpt_account_id", tokenData.AccountID)
-	setNonEmptyString(content, "email", tokenData.Email)
-	setNonEmptyString(content, "expired", tokenData.Expire)
+	setNonEmptyString(metadata, "id_token", tokenData.IDToken)
+	setNonEmptyString(metadata, "account_id", tokenData.AccountID)
+	setNonEmptyString(metadata, "chatgpt_account_id", tokenData.AccountID)
+	setNonEmptyString(metadata, "email", tokenData.Email)
+	setNonEmptyString(metadata, "expired", tokenData.Expire)
 
+	planType := ""
+	hashAccountID := ""
 	if claims, errClaims := codex.ParseJWTToken(tokenData.IDToken); errClaims == nil && claims != nil {
-		setNonEmptyString(content, "chatgpt_user_id", claims.CodexAuthInfo.ChatgptUserID)
-		setNonEmptyString(content, "plan_type", claims.CodexAuthInfo.ChatgptPlanType)
-		setNonEmptyString(content, "chatgpt_plan_type", claims.CodexAuthInfo.ChatgptPlanType)
+		planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+		setNonEmptyString(metadata, "chatgpt_user_id", claims.CodexAuthInfo.ChatgptUserID)
+		setNonEmptyString(metadata, "plan_type", planType)
+		setNonEmptyString(metadata, "chatgpt_plan_type", planType)
 		for _, organization := range claims.CodexAuthInfo.Organizations {
 			if organization.IsDefault && strings.TrimSpace(organization.ID) != "" {
-				content["organization_id"] = strings.TrimSpace(organization.ID)
+				metadata["organization_id"] = strings.TrimSpace(organization.ID)
 				break
 			}
 		}
 	}
+	if accountID := strings.TrimSpace(tokenData.AccountID); accountID != "" {
+		digest := sha256.Sum256([]byte(accountID))
+		hashAccountID = hex.EncodeToString(digest[:])[:8]
+	}
 
-	name := codexConvertedFileName(index, tokenData.Email, tokenData.AccountID)
-	content["name"] = strings.TrimSuffix(name, filepath.Ext(name))
-	return codexRefreshTokenConvertResult{file: &codexRefreshTokenConvertedFile{
-		Index:   index,
-		Name:    name,
-		Content: content,
+	return codexRefreshTokenConvertResult{credential: &codexRefreshTokenConvertedCredential{
+		index:         index,
+		tokenData:     tokenData,
+		clientID:      clientID,
+		planType:      planType,
+		hashAccountID: hashAccountID,
+		metadata:      metadata,
 	}}
 }
 
@@ -185,27 +226,104 @@ func refreshTokenFailure(index int, refreshToken string, err error) codexRefresh
 	if len(message) > maxRefreshConversionErrSize {
 		message = message[:maxRefreshConversionErrSize]
 	}
-	return codexRefreshTokenConvertResult{failure: &codexRefreshTokenConvertFailure{
-		Index: index,
-		Error: message,
-	}}
+	log.Warnf("failed to convert Codex refresh token at input index %d: %s", index, message)
+	return codexRefreshTokenConvertResult{failure: fmt.Errorf("conversion failed")}
 }
 
-var unsafeCredentialFileName = regexp.MustCompile(`[^a-zA-Z0-9._@-]+`)
+func (h *Handler) saveConvertedCodexCredential(ctx context.Context, credential *codexRefreshTokenConvertedCredential) error {
+	if credential == nil || credential.tokenData == nil {
+		return fmt.Errorf("converted credential is empty")
+	}
+	tokenData := credential.tokenData
+	fileName := codex.CredentialFileName(tokenData.Email, credential.planType, credential.hashAccountID, true)
+	if existing := h.findCodexAuthByAccountID(tokenData.AccountID); existing != nil {
+		if strings.TrimSpace(existing.FileName) != "" {
+			fileName = existing.FileName
+		}
+	}
+	if fileName == "codex-.json" {
+		if credential.hashAccountID != "" {
+			fileName = "codex-" + credential.hashAccountID + ".json"
+		} else {
+			fileName = fmt.Sprintf("codex-import-%d.json", credential.index+1)
+		}
+	}
 
-func codexConvertedFileName(index int, email, accountID string) string {
-	base := strings.TrimSpace(email)
-	if base == "" {
-		base = strings.TrimSpace(accountID)
+	storage := &codex.CodexTokenStorage{
+		IDToken:      tokenData.IDToken,
+		AccessToken:  tokenData.AccessToken,
+		RefreshToken: tokenData.RefreshToken,
+		AccountID:    tokenData.AccountID,
+		LastRefresh:  refreshMetadataString(credential.metadata["last_refresh"]),
+		Email:        tokenData.Email,
+		Type:         "codex",
+		Expire:       tokenData.Expire,
 	}
-	if base == "" {
-		base = fmt.Sprintf("codex-%d", index+1)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		Provider: "codex",
+		FileName: fileName,
+		Status:   coreauth.StatusActive,
+		Storage:  storage,
+		Metadata: credential.metadata,
 	}
-	base = strings.Trim(unsafeCredentialFileName.ReplaceAllString(base, "_"), "._-")
-	if base == "" {
-		base = fmt.Sprintf("codex-%d", index+1)
+	if existing := h.findCodexAuthByAccountID(tokenData.AccountID); existing != nil {
+		record.ID = existing.ID
+		record.CreatedAt = existing.CreatedAt
+		record.Attributes = cloneStringMap(existing.Attributes)
 	}
-	return fmt.Sprintf("%04d_%s.json", index+1, base)
+	if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
+		return fmt.Errorf("save converted credential: %w", errSave)
+	}
+	if errRegister := h.upsertAuthRecord(coreauth.WithSkipPersist(ctx), record); errRegister != nil {
+		return fmt.Errorf("register converted credential: %w", errRegister)
+	}
+	return nil
+}
+
+func (h *Handler) findCodexAuthByAccountID(accountID string) *coreauth.Auth {
+	accountID = strings.TrimSpace(accountID)
+	if h == nil || h.authManager == nil || accountID == "" {
+		return nil
+	}
+	for _, auth := range h.authManager.List() {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			continue
+		}
+		if auth.Metadata != nil {
+			candidate := ""
+			if value, ok := auth.Metadata["account_id"].(string); ok {
+				candidate = strings.TrimSpace(value)
+			}
+			if candidate == "" {
+				if value, ok := auth.Metadata["chatgpt_account_id"].(string); ok {
+					candidate = strings.TrimSpace(value)
+				}
+			}
+			if candidate == accountID {
+				return auth
+			}
+		}
+	}
+	return nil
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func refreshMetadataString(value any) string {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	return ""
 }
 
 func setNonEmptyString(target map[string]any, key, value string) {

@@ -1,7 +1,6 @@
 package management
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type fakeCodexRefreshService struct {
@@ -49,18 +49,21 @@ func (f *fakeCodexRefreshService) RefreshTokensWithClientID(_ context.Context, r
 	}, nil
 }
 
-func TestConvertCodexRefreshTokensReturnsOrderedCPAResults(t *testing.T) {
+func TestConvertCodexRefreshTokensPersistsResultsAndReturnsCounts(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	fake := &fakeCodexRefreshService{}
 	originalFactory := newCodexRefreshService
 	newCodexRefreshService = func(*config.Config) codexRefreshService { return fake }
 	t.Cleanup(func() { newCodexRefreshService = originalFactory })
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	body := []byte(`{"refresh_tokens":["good-token","secret-bad-token"],"client_id":"custom-client"}`)
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	store := &memoryAuthStore{}
+	h.tokenStore = store
+	body := `{"refresh_tokens":"good-token\r\nsecret-bad-token\ngood-token\n\n","client_id":"custom-client"}`
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-tokens/convert", bytes.NewReader(body))
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/refresh-tokens/convert", strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.ConvertCodexRefreshTokens(c)
@@ -69,29 +72,33 @@ func TestConvertCodexRefreshTokensReturnsOrderedCPAResults(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 	var response struct {
-		Total       int                               `json:"total"`
-		Converted   int                               `json:"converted"`
-		FailedCount int                               `json:"failed_count"`
-		Files       []codexRefreshTokenConvertedFile  `json:"files"`
-		Failed      []codexRefreshTokenConvertFailure `json:"failed"`
+		Total       int `json:"total"`
+		Saved       int `json:"saved"`
+		FailedCount int `json:"failed_count"`
 	}
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatalf("decode response: %v", errDecode)
 	}
-	if response.Total != 2 || response.Converted != 1 || response.FailedCount != 1 {
+	if response.Total != 2 || response.Saved != 1 || response.FailedCount != 1 {
 		t.Fatalf("unexpected counts: %+v", response)
 	}
-	if len(response.Files) != 1 || response.Files[0].Index != 0 {
-		t.Fatalf("unexpected files: %+v", response.Files)
+	for _, secret := range []string{"secret-bad-token", "new-access", "rotated-refresh"} {
+		if strings.Contains(recorder.Body.String(), secret) {
+			t.Fatalf("response leaked credential material %q", secret)
+		}
 	}
-	if response.Files[0].Content["client_id"] != "custom-client" || response.Files[0].Content["chatgpt_user_id"] != "user-123" {
-		t.Fatalf("unexpected CPA content: %#v", response.Files[0].Content)
+	stored, errList := store.List(context.Background())
+	if errList != nil || len(stored) != 1 {
+		t.Fatalf("stored credentials = %d, err = %v", len(stored), errList)
 	}
-	if len(response.Failed) != 1 || response.Failed[0].Index != 1 {
-		t.Fatalf("unexpected failures: %+v", response.Failed)
+	if stored[0].Metadata["client_id"] != "custom-client" || stored[0].Metadata["chatgpt_user_id"] != "user-123" {
+		t.Fatalf("unexpected stored metadata: %#v", stored[0].Metadata)
 	}
-	if strings.Contains(recorder.Body.String(), "secret-bad-token") {
-		t.Fatal("response leaked the submitted refresh token")
+	if stored[0].Metadata["access_token"] != "new-access" || stored[0].Metadata["refresh_token"] != "rotated-refresh" {
+		t.Fatalf("stored runtime metadata is missing refreshed tokens: %#v", stored[0].Metadata)
+	}
+	if auths := manager.List(); len(auths) != 1 {
+		t.Fatalf("runtime auth count = %d, want 1", len(auths))
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -107,7 +114,9 @@ func TestConvertCodexRefreshTokensUsesDefaultClientID(t *testing.T) {
 	newCodexRefreshService = func(*config.Config) codexRefreshService { return fake }
 	t.Cleanup(func() { newCodexRefreshService = originalFactory })
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = &memoryAuthStore{}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"refresh_tokens":["good-token"]}`))
@@ -118,5 +127,48 @@ func TestConvertCodexRefreshTokensUsesDefaultClientID(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.clientID != codex.ClientID {
 		t.Fatalf("client ID = %q, want %q", fake.clientID, codex.ClientID)
+	}
+}
+
+func TestConvertCodexRefreshTokensUpdatesExistingAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fake := &fakeCodexRefreshService{}
+	originalFactory := newCodexRefreshService
+	newCodexRefreshService = func(*config.Config) codexRefreshService { return fake }
+	t.Cleanup(func() { newCodexRefreshService = originalFactory })
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	existing := &coreauth.Auth{
+		ID:       "existing-codex.json",
+		Provider: "codex",
+		FileName: "existing-codex.json",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "codex", "account_id": "account-123"},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), existing); errRegister != nil {
+		t.Fatalf("register existing auth: %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	store := &memoryAuthStore{}
+	h.tokenStore = store
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"refresh_tokens":"good-token"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.ConvertCodexRefreshTokens(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	stored, errList := store.List(context.Background())
+	if errList != nil || len(stored) != 1 {
+		t.Fatalf("stored credentials = %d, err = %v", len(stored), errList)
+	}
+	if stored[0].ID != "existing-codex.json" {
+		t.Fatalf("stored auth ID = %q, want existing-codex.json", stored[0].ID)
+	}
+	if auths := manager.List(); len(auths) != 1 || auths[0].Metadata["refresh_token"] != "rotated-refresh" {
+		t.Fatalf("existing runtime auth was not updated: %#v", auths)
 	}
 }
