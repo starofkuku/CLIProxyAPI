@@ -834,13 +834,16 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-// DeleteAuthFile soft-deletes auth files by moving them to the recycle bin.
+// DeleteAuthFile deletes auth files.
+// Default behavior soft-deletes into the recycle bin.
+// Pass permanent=true (query) to permanently remove active auth files.
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
 	ctx := c.Request.Context()
+	permanent := isPermanentAuthFileDelete(c)
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
 		entries, err := os.ReadDir(h.cfg.AuthDir)
 		if err != nil {
@@ -857,12 +860,12 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			if !strings.HasSuffix(strings.ToLower(name), ".json") {
 				continue
 			}
-			trashedName, _, errTrash := h.trashAuthFileByName(ctx, name, "manual_delete_all")
-			if errTrash != nil {
-				failed = append(failed, gin.H{"name": name, "error": errTrash.Error()})
+			deletedName, _, errDelete := deleteAuthFileWithMode(h, ctx, name, permanent, "manual_delete_all")
+			if errDelete != nil {
+				failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
 				continue
 			}
-			deletedFiles = append(deletedFiles, trashedName)
+			deletedFiles = append(deletedFiles, deletedName)
 		}
 		if len(failed) > 0 {
 			c.JSON(http.StatusMultiStatus, gin.H{"status": "partial", "deleted": len(deletedFiles), "files": deletedFiles, "failed": failed})
@@ -882,7 +885,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	if len(names) == 1 {
-		if _, status, errDelete := h.trashAuthFileByName(ctx, names[0], "manual_delete"); errDelete != nil {
+		if _, status, errDelete := deleteAuthFileWithMode(h, ctx, names[0], permanent, "manual_delete"); errDelete != nil {
 			c.JSON(status, gin.H{"error": errDelete.Error()})
 			return
 		}
@@ -893,7 +896,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	deletedFiles := make([]string, 0, len(names))
 	failed := make([]gin.H, 0)
 	for _, name := range names {
-		deletedName, _, errDelete := h.trashAuthFileByName(ctx, name, "manual_delete")
+		deletedName, _, errDelete := deleteAuthFileWithMode(h, ctx, name, permanent, "manual_delete")
 		if errDelete != nil {
 			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
 			continue
@@ -910,6 +913,21 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
+}
+
+func isPermanentAuthFileDelete(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value := strings.TrimSpace(strings.ToLower(c.Query("permanent")))
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func deleteAuthFileWithMode(h *Handler, ctx context.Context, name string, permanent bool, softReason string) (string, int, error) {
+	if permanent {
+		return h.deleteAuthFileByName(ctx, name)
+	}
+	return h.trashAuthFileByName(ctx, name, softReason)
 }
 
 func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
