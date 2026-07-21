@@ -427,19 +427,39 @@ func clientIPFromContext(ctx context.Context) string {
 		return ""
 	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil || ginCtx.Request == nil {
+	if !ok || ginCtx == nil {
 		return ""
 	}
-	remoteAddr := strings.TrimSpace(ginCtx.Request.RemoteAddr)
-	if remoteAddr == "" {
+
+	// Prefer Gin ClientIP so X-Forwarded-For / X-Real-IP are honored when the
+	// direct peer is a trusted reverse proxy (see api.Server TrustedProxies).
+	if ip := normalizeClientIP(ginCtx.ClientIP()); ip != "" {
+		return ip
+	}
+	if ginCtx.Request == nil {
 		return ""
 	}
-	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		return strings.Trim(strings.TrimSpace(host), "[]")
+	return normalizeClientIP(ginCtx.Request.RemoteAddr)
+}
+
+func normalizeClientIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
 	}
-	trimmed := strings.Trim(remoteAddr, "[]")
-	if ip := net.ParseIP(trimmed); ip != nil {
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.Trim(strings.TrimSpace(value), "[]")
+	if value == "" {
+		return ""
+	}
+	if ip := net.ParseIP(value); ip != nil {
 		return ip.String()
+	}
+	// Keep non-IP host values only when they already look like an address token.
+	if strings.Contains(value, ":") || strings.Contains(value, ".") {
+		return value
 	}
 	return ""
 }

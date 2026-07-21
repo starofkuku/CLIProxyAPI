@@ -286,6 +286,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create gin engine
 	engine := gin.New()
+	// Honor X-Forwarded-For / X-Real-IP when the direct peer is a reverse proxy.
+	// Private/link-local ranges cover Docker, k8s, and HF Space sidecar hops.
+	// Public cloud LBs with non-private source IPs can expand this via WithEngineConfigurator.
+	engine.ForwardedByClientIP = true
+	if errTrusted := engine.SetTrustedProxies(defaultTrustedProxies()); errTrusted != nil {
+		log.WithError(errTrusted).Warn("failed to configure gin trusted proxies; falling back to defaults")
+	}
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
@@ -2032,4 +2039,21 @@ func configuredSignatureBypassStrict(cfg *config.Config) bool {
 		return *cfg.AntigravitySignatureBypassStrict
 	}
 	return false
+}
+
+// defaultTrustedProxies returns CIDRs treated as reverse proxies for ClientIP().
+// Private/link-local ranges cover Docker, Kubernetes, and Hugging Face Space hops.
+// Deployments behind a public cloud load balancer can expand the list with
+// api.WithEngineConfigurator / cliproxy.WithEngineConfigurator.
+func defaultTrustedProxies() []string {
+	return []string{
+		"127.0.0.0/8",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"169.254.0.0/16",
+		"::1/128",
+		"fc00::/7",
+		"fe80::/10",
+	}
 }

@@ -388,10 +388,55 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestClientIPFromContextUsesForwardedHeaderBehindTrustedProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.ForwardedByClientIP = true
+	if err := engine.SetTrustedProxies([]string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
+	ginCtx := gin.CreateTestContextOnly(httptest.NewRecorder(), engine)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ginCtx.Request.RemoteAddr = "10.16.13.247:43210"
+	ginCtx.Request.Header.Set("X-Forwarded-For", "203.0.113.50, 10.16.13.247")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	if got := clientIPFromContext(ctx); got != "203.0.113.50" {
+		t.Fatalf("clientIPFromContext = %q, want %q", got, "203.0.113.50")
+	}
+
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 1}, false)
+	if record.ClientIP != "203.0.113.50" {
+		t.Fatalf("record.ClientIP = %q, want %q", record.ClientIP, "203.0.113.50")
+	}
+}
+
+func TestClientIPFromContextFallsBackToRemoteAddr(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		t.Fatalf("SetTrustedProxies(nil): %v", err)
+	}
+	ginCtx := gin.CreateTestContextOnly(httptest.NewRecorder(), engine)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ginCtx.Request.RemoteAddr = "203.0.113.8:54321"
+	ginCtx.Request.Header.Set("X-Forwarded-For", "198.51.100.9")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	if got := clientIPFromContext(ctx); got != "203.0.113.8" {
+		t.Fatalf("clientIPFromContext = %q, want remote addr %q", got, "203.0.113.8")
+	}
+}
+
 func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	delay := 40 * time.Millisecond
 	gin.SetMode(gin.TestMode)
-	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	engine := gin.New()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		t.Fatalf("SetTrustedProxies(nil): %v", err)
+	}
+	ginCtx := gin.CreateTestContextOnly(httptest.NewRecorder(), engine)
 	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	ginCtx.Request.RemoteAddr = "203.0.113.8:54321"
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
