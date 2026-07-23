@@ -7,7 +7,8 @@ on:
 
 env:
   APP_NAME: CLIProxyAPI
-  DOCKERHUB_REPO: eceasy/cli-proxy-api
+  # Fork image namespace on Docker Hub.
+  DOCKERHUB_REPO: dx95/cliproxy
 
 jobs:
   docker_amd64:

@@ -16,6 +16,11 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 ```
 - Common flags: `--config <path>`, `--tui`, `--standalone`, `--local-model`, `--no-browser`, `--oauth-callback-port <port>`
 
+## Fork Docker Release
+- Follow [`DOCKER_RELEASE.md`](./DOCKER_RELEASE.md) when the user asks to build and push the fork's backend image.
+- The current fixed Docker Hub tag is `dx95/cliproxy:gpt-5.6-v7.2.71`. Replacing it is an external release action; only push when the user explicitly requests it.
+- Build from this repository root and report the source commit, image tag, platform, and pushed digest.
+
 ## Config
 - Default config: `config.yaml` (template: `config.example.yaml`)
 - `.env` is auto-loaded from the working directory
