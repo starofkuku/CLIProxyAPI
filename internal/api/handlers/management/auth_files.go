@@ -986,6 +986,13 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			dst = abs
 		}
 	}
+	// Normalize Agent Identity payloads into CPA codex auth files while keeping
+	// the existing /auth-files upload path unchanged for callers.
+	normalized, errNormalize := codex.NormalizeAgentIdentityAuthFile(data)
+	if errNormalize != nil {
+		return fmt.Errorf("invalid agent identity credential: %w", errNormalize)
+	}
+	data = normalized
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err

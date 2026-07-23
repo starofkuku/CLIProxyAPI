@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -723,9 +725,12 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	apiKey, _ := codexCreds(auth)
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+	authHeader, err := resolveCodexAuthorization(req.Context(), auth)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(authHeader) != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -1376,6 +1381,10 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
+	// Agent Identity accounts do not use OAuth access/refresh tokens.
+	if auth != nil && codexauth.IsAgentIdentityAuth(auth.Metadata) {
+		return auth, nil
+	}
 	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
 		return refreshed, err
 	}
@@ -1632,7 +1641,11 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 
 func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
+	authHeader := "Bearer " + token
+	if resolved, err := resolveCodexAuthorization(r.Context(), auth); err == nil && strings.TrimSpace(resolved) != "" {
+		authHeader = resolved
+	}
+	r.Header.Set("Authorization", authHeader)
 
 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
@@ -1936,6 +1949,65 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func resolveCodexAuthorization(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	if codexauth.IsAgentIdentityAuth(auth.Metadata) {
+		if auth.Metadata == nil {
+			return "", fmt.Errorf("codex agent identity metadata is missing")
+		}
+		lockKey := strings.TrimSpace(auth.ID)
+		if lockKey == "" {
+			lockKey = firstMetadataString(auth.Metadata, "account_id", "agent_runtime_id")
+		}
+		taskID, updated, err := codexauth.EnsureAgentIdentityTask(ctx, auth.Metadata, lockKey, nil)
+		if err != nil {
+			return "", err
+		}
+		if updated {
+			persistCodexAgentIdentityMetadata(auth)
+		}
+		runtimeID := firstMetadataString(auth.Metadata, "agent_runtime_id", "agentRuntimeId")
+		privateKey := firstMetadataString(auth.Metadata, "agent_private_key", "agentPrivateKey")
+		return codexauth.BuildAgentAssertion(runtimeID, taskID, privateKey, time.Now())
+	}
+	apiKey, _ := codexCreds(auth)
+	if strings.TrimSpace(apiKey) == "" {
+		return "", nil
+	}
+	return "Bearer " + apiKey, nil
+}
+
+func firstMetadataString(metadata map[string]any, keys ...string) string {
+	if metadata == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func persistCodexAgentIdentityMetadata(auth *cliproxyauth.Auth) {
+	if auth == nil || auth.Metadata == nil || auth.Attributes == nil {
+		return
+	}
+	path := strings.TrimSpace(auth.Attributes["path"])
+	if path == "" {
+		return
+	}
+	raw, err := json.MarshalIndent(auth.Metadata, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, append(raw, '\n'), 0o600)
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {

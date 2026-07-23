@@ -912,8 +912,15 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if headers == nil {
 		headers = http.Header{}
 	}
+	authHeader := ""
 	if strings.TrimSpace(token) != "" {
-		headers.Set("Authorization", "Bearer "+token)
+		authHeader = "Bearer " + token
+	}
+	if resolved, err := resolveCodexAuthorization(ctx, auth); err == nil && strings.TrimSpace(resolved) != "" {
+		authHeader = resolved
+	}
+	if strings.TrimSpace(authHeader) != "" {
+		headers.Set("Authorization", authHeader)
 	}
 
 	var ginHeaders http.Header
